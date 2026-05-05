@@ -8,7 +8,7 @@ description: Black-box end-to-end test of any GUI application (local X11 under X
 You (the dev session) **author** a behavioural scenario. `bin/e2e-run.sh` **runs** it in a fresh, headless tester
 whose only tools are `e2e <verb>` (a shim on its PATH) and a file viewer limited to its own screenshots. The tester
 never sees the code, the paths or the build. A **profile** adapts the target app: how to start and stop it, where
-its logs are, and how to apply fixtures. Requires the `ui-drive` skill (`~/.claude/skills/ui-drive/bin/uidrive`), plus
+its logs are, and how to apply fixtures. Requires the `uidrive` CLI of the `ui-drive` skill (found next to this skill in the repo, or set `$UIDRIVE`), plus
 `jq`, `perl`, ImageMagick `convert`, `flock` and `Xvfb`/`xdotool` for local apps.
 
 ## 1. Pick or write a profile

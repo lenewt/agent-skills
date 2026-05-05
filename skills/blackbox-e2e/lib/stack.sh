@@ -2,7 +2,15 @@
 # Helpers for blackbox-e2e profiles, sourced by the runner and by `e2e` before the
 # profile. Process helpers keep their state in $E2E_PRIV (pids, *.out, log offsets).
 
-UIDRIVE=${UIDRIVE:-$HOME/.claude/skills/ui-drive/bin/uidrive}
+# uidrive (ui-drive skill): $UIDRIVE, else next to this skill in the same repo (resolved through
+# the install symlinks, so it works whichever tools the skills are linked into), else installed or on PATH.
+if [ -z "${UIDRIVE:-}" ]; then
+    for UIDRIVE in "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../../ui-drive/bin/uidrive" \
+                   "$HOME/.claude/skills/ui-drive/bin/uidrive" "$HOME/.copilot/skills/ui-drive/bin/uidrive" \
+                   "$(command -v uidrive 2> /dev/null || true)"; do
+        [ -x "$UIDRIVE" ] && break
+    done
+fi
 
 die() { echo "e2e: $*" >&2; exit 1; }                 # a verb failed (tester sees it)
 blocked() { echo "E2E: BLOCKED ($*)"; exit 3; }       # the run cannot be carried out (runner)
