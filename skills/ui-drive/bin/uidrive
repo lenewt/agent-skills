@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# uidrive — screenshot + input injection for X11 UIs, local (incl. Xvfb) or remote over SSH.
+# Designed for embedded device UIs (Qt / GTK / any X11 toolkit) and their desktop simulators.
+set -euo pipefail
+
+TARGET="${UIDRIVE_TARGET:-local}"
+DPY="${UIDRIVE_DISPLAY:-}"
+
+SSHOPTS=(-o BatchMode=yes -o ConnectTimeout=5
+         -o ControlMaster=auto -o ControlPath="$HOME/.ssh/.uidrive-%r@%h" -o ControlPersist=120)
+
+usage() {
+  cat >&2 <<'EOF'
+usage: uidrive [-t local|USER@HOST] [-d :N] COMMAND [ARGS]
+
+  -t   target: "local" (default) or an ssh destination, e.g. root@192.168.1.50
+  -d   X display (default: local $DISPLAY, or :0 on remote targets)
+       env fallbacks: UIDRIVE_TARGET, UIDRIVE_DISPLAY
+
+commands:
+  geom                       print display size as "WIDTH HEIGHT"
+  shot OUT.png               capture the full screen into local file OUT.png
+  record OUT.mp4 [SECONDS]   record the screen (default 10 s, 15 fps)
+  tap X Y                    left-click at screen coordinates
+  swipe X1 Y1 X2 Y2 [MS]     press-drag-release, MS total duration (default 300)
+  key KEYSYM                 send a key (Return, Escape, ...)
+  type TEXT                  type literal text
+  windows                    list visible windows (ID | geometry | name)
+  winfo NAME|ID              show one window's ID, name, position, size
+  raise NAME|ID              activate/raise a window
+  wintap NAME|ID X Y         raise a window, click at window-RELATIVE X Y
+  winshot NAME|ID OUT.png    capture one window (local targets, needs imagemagick)
+  x ARGS...                  raw xdotool passthrough on the target
+
+Remote targets need: sshd + xdotool + ffmpeg. xdotool calls are issued one per
+invocation (old builds don't support command chaining).
+EOF
+  exit 1
+}
+
+die() { echo "uidrive: $*" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -t) TARGET=$2; shift 2 ;;
+    -d) DPY=$2; shift 2 ;;
+    -h|--help) usage ;;
+    -*) die "unknown option $1" ;;
+    *) break ;;
+  esac
+done
+[ $# -ge 1 ] || usage
+CMD=$1; shift
+
+if [ -z "$DPY" ]; then
+  if [ "$TARGET" = local ]; then DPY="${DISPLAY:-:0}"; else DPY=":0"; fi
+fi
+
+# Run shell code on the target with DISPLAY set.
+xsh() {
+  local code="export DISPLAY=$DPY; $1"
+  if [ "$TARGET" = local ]; then bash -c "$code"; else ssh "${SSHOPTS[@]}" "$TARGET" "$code"; fi
+}
+
+# Move a file produced on the target to a local path.
+fetch() {
+  if [ "$TARGET" = local ]; then mv "$1" "$2"
+  else scp -q "${SSHOPTS[@]}" "$TARGET:$1" "$2"; xsh "rm -f $1" || true; fi
+}
+
+get_geom() {
+  local g
+  g=$(xsh 'xdotool getdisplaygeometry 2>/dev/null' || true)
+  [ -n "$g" ] || g=$(xsh 'xdpyinfo 2>/dev/null | grep dimensions' 2>/dev/null \
+                     | grep -o '[0-9]*x[0-9]*' | head -n1 | tr x ' ' || true)
+  [ -n "$g" ] || g=$(xsh 'xrandr --current 2>/dev/null | grep "\*"' 2>/dev/null \
+                     | grep -o '[0-9]*x[0-9]*' | head -n1 | tr x ' ' || true)
+  echo "$g"
+}
+
+# NAME-or-ID -> window ID. Name matching is regex and case-insensitive (xdotool);
+# among matches, prefer a window whose full title equals the pattern.
+resolve_win() {
+  case "$1" in
+    *[!0-9]*)
+      local ids id first=""
+      ids=$(xsh "xdotool search --onlyvisible --name '$1' 2>/dev/null" || true)
+      for id in $ids; do
+        [ -n "$first" ] || first=$id
+        if [ "$(xsh "xdotool getwindowname $id 2>/dev/null")" = "$1" ]; then echo "$id"; return; fi
+      done
+      echo "$first"
+      ;;
+    *) echo "$1" ;;
+  esac
+}
+
+grab_args() {  # -> "-video_size WxH" when geometry is known, else empty
+  local g; g=$(get_geom)
+  if [ -n "$g" ]; then echo "-video_size ${g%% *}x${g##* }"; else echo ""; fi
+}
+
+case "$CMD" in
+  geom)
+    g=$(get_geom); [ -n "$g" ] || die "could not determine display geometry"
+    echo "$g"
+    ;;
+  shot)
+    [ $# -eq 1 ] || usage
+    if [ "$TARGET" = local ] && command -v import >/dev/null 2>&1; then
+      xsh "import -silent -window root '$1'"
+    else
+      xsh "ffmpeg -loglevel error -f x11grab $(grab_args) -i $DPY -frames:v 1 -y /tmp/.uidrive.png"
+      fetch /tmp/.uidrive.png "$1"
+    fi
+    ;;
+  record)
+    [ $# -ge 1 ] || usage
+    sec=${2:-10}
+    xsh "ffmpeg -loglevel error -f x11grab $(grab_args) -i $DPY -t $sec -r 15 \
+         -vf 'crop=trunc(iw/2)*2:trunc(ih/2)*2' -c:v mpeg4 -q:v 6 -y /tmp/.uidrive.mp4"
+    fetch /tmp/.uidrive.mp4 "$1"
+    ;;
+  tap)
+    [ $# -eq 2 ] || usage
+    xsh "xdotool mousemove $1 $2; xdotool click 1"
+    ;;
+  swipe)
+    [ $# -ge 4 ] || usage
+    x1=$1 y1=$2 x2=$3 y2=$4 ms=${5:-300} steps=12
+    st=$(awk "BEGIN{printf \"%.3f\", $ms/$steps/1000}")
+    code="xdotool mousemove $x1 $y1; xdotool mousedown 1"
+    for i in $(seq 1 $steps); do
+      code="$code; sleep $st; xdotool mousemove $(( x1 + (x2-x1)*i/steps )) $(( y1 + (y2-y1)*i/steps ))"
+    done
+    xsh "$code; xdotool mouseup 1"
+    ;;
+  key)
+    [ $# -eq 1 ] || usage
+    xsh "xdotool key --clearmodifiers '$1'"
+    ;;
+  type)
+    [ $# -eq 1 ] || usage
+    xsh "xdotool type --delay 50 '$1'"
+    ;;
+  windows)
+    xsh 'for w in $(xdotool search --onlyvisible --name "." 2>/dev/null); do
+           n=$(xdotool getwindowname "$w" 2>/dev/null)
+           g=$(xdotool getwindowgeometry "$w" 2>/dev/null | tr "\n" " " | tr -s " ")
+           [ -n "$n" ] && echo "$w | $g| $n"
+         done'
+    ;;
+  winfo)
+    [ $# -eq 1 ] || usage
+    id=$(resolve_win "$1"); [ -n "$id" ] || die "no visible window matching '$1'"
+    xsh "echo ID: $id; echo NAME: \$(xdotool getwindowname $id); xdotool getwindowgeometry $id"
+    ;;
+  raise)
+    [ $# -eq 1 ] || usage
+    id=$(resolve_win "$1"); [ -n "$id" ] || die "no visible window matching '$1'"
+    xsh "xdotool windowactivate $id"
+    ;;
+  wintap)
+    [ $# -eq 3 ] || usage
+    id=$(resolve_win "$1"); [ -n "$id" ] || die "no visible window matching '$1'"
+    pos=$(xsh "xdotool getwindowgeometry $id" | awk '/Position/{print $2}')
+    px=${pos%%,*}; py=${pos##*,}
+    xsh "xdotool windowactivate $id; sleep 0.4; xdotool mousemove $(( px + $2 )) $(( py + $3 )); xdotool click 1"
+    ;;
+  winshot)
+    [ $# -eq 2 ] || usage
+    id=$(resolve_win "$1"); [ -n "$id" ] || die "no visible window matching '$1'"
+    xsh "command -v import >/dev/null" || die "winshot needs imagemagick 'import' on the target; use 'shot' instead"
+    if [ "$TARGET" = local ]; then
+      xsh "import -silent -window $id '$2'"
+    else
+      xsh "import -silent -window $id /tmp/.uidrive.png"
+      fetch /tmp/.uidrive.png "$2"
+    fi
+    ;;
+  x)
+    xsh "xdotool $*"
+    ;;
+  *)
+    die "unknown command '$CMD' (see uidrive -h)"
+    ;;
+esac

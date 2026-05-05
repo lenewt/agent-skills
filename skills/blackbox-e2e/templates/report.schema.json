@@ -1,0 +1,24 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "steps", "screenshots", "log_lines", "notes"],
+  "properties": {
+    "verdict": { "enum": ["PASS", "FAIL", "BLOCKED"] },
+    "steps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["n", "status", "evidence"],
+        "properties": {
+          "n": { "type": "integer" },
+          "status": { "enum": ["PASS", "FAIL", "SKIPPED"] },
+          "evidence": { "type": "string", "maxLength": 400 }
+        }
+      }
+    },
+    "screenshots": { "type": "array", "maxItems": 2, "items": { "type": "string" } },
+    "log_lines": { "type": "array", "maxItems": 10, "items": { "type": "string", "maxLength": 800 } },
+    "notes": { "type": "string", "maxLength": 800 }
+  }
+}

@@ -1,0 +1,4 @@
+# <skill> <tools: claude,copilot>   (install.sh links skills/<skill> into each tool's skills dir)
+blackbox-e2e  claude,copilot
+whitebox-e2e  claude,copilot
+ui-drive      claude
