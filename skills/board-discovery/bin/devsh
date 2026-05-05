@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""devsh - run shell commands on a target device over serial, ssh, adb or locally.
+
+Usage:
+  devsh [-T TARGET] [-t TIMEOUT] [-u USER] [--noise REGEX] [--raw] CMD [CMD ...]
+  devsh [-T TARGET] --check          # one round trip, prints the transport and the remote `uname -a`
+  devsh [-T TARGET] -i               # print how to open an interactive session instead
+
+TARGET (or $DEVSH_TARGET):
+  serial[:/dev/ttyUSB0][@115200]     login shell on a serial console (no port: the first ttyUSB*/ttyACM* that answers)
+  ssh:[user@]host[:port]             one multiplexed ssh connection, BatchMode (keys or empty password)
+  adb[:serial]                       `adb shell`
+  local                              this machine (for testing probes)
+
+Each CMD runs in the target's shell. Output: "### CMD   [rc=N]" then the output (stderr merged).
+Secrets that look like key=value (password, secret, token, psk, api key, private key) are redacted
+unless --raw. Exit 0 when every CMD returned 0, 1 otherwise, 2 when the target is unreachable.
+
+Serial: logs in as USER (password from $DEVSH_PASSWORD if prompted), disables echo, sets PAGER=cat
+(nmcli/systemctl otherwise wedge the console) and brackets each command with markers, so console
+noise from services writing to the tty is tolerated. --noise drops matching output lines (e.g. a log
+timestamp prefix '^\\d\\d/\\d\\d/\\d{4} ').
+"""
+import argparse, glob, os, re, shlex, subprocess, sys, time
+
+SECRET = re.compile(r'(?i)\b([\w.-]*(?:passw(?:or)?d|passphrase|secret|token|api[_-]?key|psk|private[_-]?key|credential)[\w.-]*'
+                    r'["\']?\s*[=:]\s*)("[^"]*"|\'[^\']*\'|\S+)')
+
+
+ANSI = re.compile(r'\x1b\[[0-9;?]*[A-Za-z]')
+
+
+def redact(text):
+    return SECRET.sub(lambda m: m.group(1) + '<redacted>', ANSI.sub('', text))
+
+
+def block(cmd):
+    """CMD as the body of a one-line { ...; } group (no newline: an interactive shell would print PS2)."""
+    cmd = cmd.strip().rstrip(';').strip()
+    return cmd if cmd.endswith('&') else cmd + ';'
+
+
+def parse_target(t):
+    kind, _, rest = t.partition(':')
+    if kind == 'serial':
+        port, _, baud = rest.partition('@')
+        return kind, {'port': port or None, 'baud': int(baud or 115200)}
+    if kind == 'ssh':
+        if not rest:
+            sys.exit('devsh: ssh target needs a host: ssh:[user@]host[:port]')
+        host, port = rest, None
+        m = re.match(r'^(.*):(\d+)$', rest)
+        if m:
+            host, port = m.group(1), m.group(2)
+        return kind, {'host': host, 'port': port}
+    if kind == 'adb':
+        return kind, {'serial': rest or None}
+    if kind == 'local':
+        return kind, {}
+    sys.exit(f'devsh: unknown target {t!r} (serial|ssh|adb|local)')
+
+
+class Serial:
+    PROMPT = rb'[#$>] ?$'
+
+    def __init__(self, o, user):
+        try:
+            import serial
+        except ImportError:
+            sys.exit('devsh: pyserial missing (pip install pyserial)')
+        self.serial, self.user, self.o, self.s = serial, user, o, None
+
+    def _read_until(self, pats, t):
+        end, buf = time.time() + t, b''
+        while time.time() < end:
+            d = self.s.read(4096)
+            if d:
+                buf += d
+                for p in pats:
+                    if re.search(p, buf):
+                        return buf, p
+        return buf, None
+
+    def _send(self, line):
+        # Paced: busy consoles drop characters of a burst.
+        data = line.encode() + b'\n'
+        for k in range(0, len(data), 16):
+            self.s.write(data[k:k + 16])
+            self.s.flush()
+            time.sleep(0.004)
+
+    def open(self):
+        ports = [self.o['port']] if self.o['port'] else sorted(glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*'))
+        for port in ports:
+            try:
+                self.s = self.serial.Serial(port, self.o['baud'], timeout=0.1)
+            except Exception as e:
+                print(f'!! cannot open {port}: {e}', file=sys.stderr)
+                continue
+            if self._open():
+                self.o['port'] = port
+                return True
+            self.s.close()
+        return False
+
+    def _open(self):
+        # Leave a possible pager or half-typed line, then look for a login or shell prompt.
+        self.s.write(b'q')
+        time.sleep(0.2)
+        self.s.write(b'\x03\n')
+        self.s.flush()
+        buf, p = self._read_until([rb'login: ?$', self.PROMPT], 3)
+        if p == rb'login: ?$' or (p is None and b'login:' in buf[-200:]):
+            self._send(self.user)
+            buf, p = self._read_until([rb'[Pp]assword: ?$', self.PROMPT], 5)
+            if p == rb'[Pp]assword: ?$':
+                self._send(os.environ.get('DEVSH_PASSWORD', ''))
+                buf, p = self._read_until([self.PROMPT, rb'incorrect'], 8)
+                if p != self.PROMPT:
+                    print('!! serial login failed (set DEVSH_PASSWORD?)', file=sys.stderr)
+                    return False
+            time.sleep(0.5)
+            self.s.read(65536)
+        elif p is None:
+            return False
+        self._send('stty -echo 2>/dev/null; export PAGER=cat SYSTEMD_PAGER=cat')
+        self._read_until([self.PROMPT], 2)
+        return True
+
+    def run(self, i, cmd, timeout):
+        if len(cmd) > 3000:
+            return -1, '!! command longer than the tty line limit; split it'
+        beg, end = f'__DEVSH_B{i}__', f'__DEVSH_E{i}__'
+        self.s.read(65536)
+        # Piped through cat so stdout is not the tty (no colours, no ls columns); the end marker
+        # is printed inside the pipe to keep the command's own exit code.
+        self._send(f'echo {beg}; {{ {{ {block(cmd)} }}; echo {end}$?; }} 2>&1 </dev/null | cat')
+        buf, _ = self._read_until([re.escape(end.encode()) + rb'(\d+)'], timeout)
+        txt = buf.decode('utf-8', 'replace').replace('\r', '')
+        mb = re.search(beg + r'$', txt, re.M)
+        me = re.search(end + r'(\d+)', txt)
+        body = txt[mb.end() if mb else 0:me.start() if me else len(txt)]
+        if not me:
+            # Interrupt the hung command so the next one starts at a prompt.
+            self.s.write(b'\x03\n')
+            self.s.flush()
+            return -1, body + '\n!! timeout'
+        return int(me.group(1)), body
+
+    def interactive(self):
+        return f"picocom -b {self.o['baud']} {self.o['port'] or '/dev/ttyUSB0'}    (quit: C-a C-x)"
+
+
+class Subproc:
+    """ssh, adb and local: one process per command."""
+
+    def __init__(self, kind, o, user):
+        self.kind, self.o = kind, o
+        if kind == 'ssh':
+            host = o['host'] if '@' in o['host'] else f'{user}@{o["host"]}'
+            cp = os.path.join(os.environ.get('XDG_RUNTIME_DIR', '/tmp'), 'devsh-%C')
+            self.base = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8',
+                         '-o', 'StrictHostKeyChecking=' + os.environ.get('DEVSH_HOSTKEY', 'accept-new'),
+                         '-o', 'ControlMaster=auto', '-o', f'ControlPath={cp}', '-o', 'ControlPersist=120']
+            if o['port']:
+                self.base += ['-p', o['port']]
+            self.base += [host]
+        elif kind == 'adb':
+            self.base = ['adb'] + (['-s', o['serial']] if o['serial'] else []) + ['shell']
+        else:
+            self.base = None
+
+    def open(self):
+        rc, out = self.run(0, 'true', 15)
+        if rc != 0:
+            print(f'!! {self.kind} target unreachable: {out.strip()}', file=sys.stderr)
+        return rc == 0
+
+    def run(self, i, cmd, timeout):
+        script = f'export PAGER=cat SYSTEMD_PAGER=cat; {{ {block(cmd)} }} 2>&1 </dev/null'
+        argv = (self.base + [script]) if self.base else ['sh', '-c', script]
+        try:
+            p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               stdin=subprocess.DEVNULL, timeout=timeout)
+        except subprocess.TimeoutExpired as e:
+            return -1, (e.stdout or b'').decode('utf-8', 'replace') + '\n!! timeout'
+        out = p.stdout.decode('utf-8', 'replace').replace('\r', '')
+        rc = p.returncode
+        if self.kind == 'ssh' and rc == 255:
+            return -1, out
+        return rc, out
+
+    def interactive(self):
+        return ' '.join(shlex.quote(a) for a in self.base) if self.base else '$SHELL'
+
+
+def connect(target, user):
+    kind, o = parse_target(target)
+    return Serial(o, user) if kind == 'serial' else Subproc(kind, o, user)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('-T', '--target', default=os.environ.get('DEVSH_TARGET', 'serial'))
+    ap.add_argument('-t', '--timeout', type=float, default=float(os.environ.get('DEVSH_TIMEOUT', 30)))
+    ap.add_argument('-u', '--user', default=os.environ.get('DEVSH_USER', 'root'))
+    ap.add_argument('--noise', default=os.environ.get('DEVSH_NOISE'), help='drop output lines matching this regex')
+    ap.add_argument('--raw', action='store_true', help='do not redact secrets')
+    ap.add_argument('--check', action='store_true')
+    ap.add_argument('-i', action='store_true', help='print the interactive command')
+    ap.add_argument('cmds', nargs='*')
+    a = ap.parse_args()
+
+    t = connect(a.target, a.user)
+    if a.i:
+        if isinstance(t, Serial) and not t.o['port']:
+            t.open()   # find the port that answers
+        print(t.interactive())
+        return 0
+    if a.check:
+        a.cmds = ['uname -a']
+    if not a.cmds:
+        ap.error('no command')
+    if not t.open():
+        print(f'!! no shell on {a.target} (powered, cabled, right port/baud/host?)', file=sys.stderr)
+        return 2
+    noise = re.compile(a.noise) if a.noise else None
+    worst = 0
+    for i, c in enumerate(a.cmds):
+        rc, body = t.run(i, c, a.timeout)
+        if noise:
+            body = '\n'.join(l for l in body.split('\n') if not noise.search(l))
+        if not a.raw:
+            body = redact(body)
+        worst = worst or (rc != 0)
+        print(f'### {c}   [rc={rc}]\n{body.strip(chr(10))}')
+        sys.stdout.flush()
+    return 1 if worst else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

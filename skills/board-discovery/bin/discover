@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""discover - read-only inventory of a target board, saved as a snapshot per board.
+
+Usage:
+  discover [-T TARGET] [--name ID] [--only a,b] [--noise REGEX]     full probe run -> snapshot
+  discover [-T TARGET] [--name ID] --app PATTERN                    deep-dive on processes matching PATTERN
+  discover --diff [--name ID] [OLD [NEW]]                           drift between two snapshots (default: last two)
+  discover --list [--name ID]                                       boards and snapshots on file
+  discover --probes                                                 list the probes
+
+TARGET is a devsh target (serial[:port][@baud], ssh:[user@]host[:port], adb[:serial], local), default
+$DEVSH_TARGET. Snapshots go to $BOARD_DISCOVERY_HOME (default ~/.local/state/board-discovery)/<board id>/:
+  <UTC stamp>/snapshot.md   one section per probe, secrets redacted
+  <UTC stamp>/meta.json     target, board id, per-probe rc and duration
+  apps/<pattern>-<stamp>.md deep-dives
+  target                    the last target that reached this board (used by --app/--diff when -T is omitted)
+The board id is hostname plus the first 8 chars of /etc/machine-id (or the device-tree serial), or --name.
+Nothing is written on the board.
+"""
+import argparse, difflib, importlib.machinery, importlib.util, json, os, re, sys, time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+_loader = importlib.machinery.SourceFileLoader('devsh', os.path.join(HERE, 'devsh'))
+_spec = importlib.util.spec_from_loader('devsh', _loader)
+devsh = importlib.util.module_from_spec(_spec)
+_loader.exec_module(devsh)
+
+HOME = os.environ.get('BOARD_DISCOVERY_HOME') or os.path.join(
+    os.environ.get('XDG_STATE_HOME', os.path.expanduser('~/.local/state')), 'board-discovery')
+PROBES = os.path.join(HERE, '..', 'lib', 'probes.txt')
+
+ID_CMD = ('hostname; (cat /etc/machine-id 2>/dev/null || tr -d "\\0" </proc/device-tree/serial-number 2>/dev/null '
+          '|| grep -m1 ^Serial /proc/cpuinfo | awk "{print \\$3}") | head -n 1')
+
+# Deep-dive on one process; {pid} is substituted. One line each, read-only.
+APP_CMDS = [
+    ('cmdline', 'tr "\\0" " " </proc/{pid}/cmdline; echo; echo "exe: $(readlink /proc/{pid}/exe)"; echo "cwd: $(readlink /proc/{pid}/cwd)"; echo "user: $(awk \'/^Uid/{{print $2}}\' /proc/{pid}/status)"'),
+    ('parents', 'p={pid}; while [ "$p" -gt 1 ] 2>/dev/null; do p=$(awk \'/^PPid/{{print $2}}\' /proc/$p/status); [ "$p" -ge 1 ] 2>/dev/null && echo "$p $(tr "\\0" " " </proc/$p/cmdline | cut -c1-200)"; done'),
+    ('children', 'for d in /proc/[0-9]*; do [ "$(awk \'/^PPid/{{print $2}}\' $d/status 2>/dev/null)" = {pid} ] && echo "${{d#/proc/}} $(tr "\\0" " " <$d/cmdline | cut -c1-200)"; done'),
+    ('unit', 'u=$(grep -o "[^/]*\\.service" /proc/{pid}/cgroup 2>/dev/null | head -n 1); echo "unit: ${{u:-none}}"; [ -n "$u" ] && systemctl cat "$u" --no-pager 2>/dev/null && systemctl show "$u" -p Restart,WatchdogUSec,StandardOutput,User,WorkingDirectory --no-pager 2>/dev/null'),
+    ('environment', 'tr "\\0" "\\n" </proc/{pid}/environ 2>/dev/null | sort'),
+    ('open-files', 'ls -l /proc/{pid}/fd 2>/dev/null | sed -n "s/.*-> //p" | sed -E "s/(socket|pipe|anon_inode):.*/\\1/" | sort | uniq -c | sort -nr | head -n 60'),
+    ('libraries', 'awk \'$6 ~ /\\.so/ {{print $6}}\' /proc/{pid}/maps 2>/dev/null | sort -u | grep -vE "^/(usr/)?lib(32|64)?/[^/]*$" | head -n 60'),
+    ('sockets', '(ss -tunlp 2>/dev/null || netstat -tunlp 2>/dev/null) | grep "pid={pid}[,)]\\|{pid}/" | head -n 20'),
+]
+
+
+def load_probes():
+    out = []
+    for line in open(PROBES):
+        line = line.rstrip('\n')
+        if not line.strip() or line.startswith('#'):
+            continue
+        name, timeout, mode, cmd = line.split('|', 3)
+        out.append({'name': name, 'timeout': float(timeout), 'diff': mode, 'cmd': cmd})
+    return out
+
+
+def open_target(target, noise):
+    t = devsh.connect(target, os.environ.get('DEVSH_USER', 'root'))
+    if not t.open():
+        sys.exit(f'!! no shell on {target}')
+    nre = re.compile(noise) if noise else None
+
+    def run(i, cmd, timeout):
+        rc, body = t.run(i, cmd, timeout)
+        if nre:
+            body = '\n'.join(l for l in body.split('\n') if not nre.search(l))
+        return rc, devsh.redact(body).strip('\n')
+    return run
+
+
+def board_id(run, name):
+    if name:
+        return name
+    rc, out = run(0, ID_CMD, 20)
+    lines = [l.strip() for l in out.split('\n') if l.strip()]
+    host = re.sub(r'[^\w.-]', '_', lines[0]) if lines else 'unknown'
+    suffix = re.sub(r'\W', '', lines[1])[:8] if len(lines) > 1 else ''
+    return f'{host}-{suffix}' if suffix else host
+
+
+def stamp():
+    return time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
+
+
+def remember_target(bdir, target, noise):
+    os.makedirs(bdir, exist_ok=True)
+    with open(os.path.join(bdir, 'target'), 'w') as f:
+        f.write(target + '\n' + (noise or '') + '\n')
+
+
+def saved_target(name):
+    if not name:
+        return None, None
+    p = os.path.join(HOME, name, 'target')
+    if os.path.exists(p):
+        lines = open(p).read().split('\n')
+        return lines[0], (lines[1] or None)
+    return None, None
+
+
+def snapshots(bid):
+    d = os.path.join(HOME, bid)
+    return sorted(x for x in os.listdir(d) if re.match(r'^\d{8}T\d{6}Z$', x)) if os.path.isdir(d) else []
+
+
+def parse_snapshot(path):
+    secs, cur = {}, None
+    for line in open(os.path.join(path, 'snapshot.md')):
+        m = re.match(r'^## (\S+)', line)
+        if m:
+            cur = m.group(1)
+            secs[cur] = []
+        elif cur and not line.startswith('```'):
+            secs[cur].append(line.rstrip('\n'))
+    return secs
+
+
+def summarize(secs):
+    """A few headline facts for the terminal; the snapshot holds the rest."""
+    s = []
+    g = lambda k: secs.get(k, '')
+    m = re.search(r'PRETTY_NAME="?([^"\n]+)', g('identity'))
+    s.append(f"os: {m.group(1) if m else '?'} | kernel: {(g('identity').split(chr(10)) + ['', ''])[1]}")
+    s.append(f"init: {g('init').split(chr(10))[0]} | net: {' '.join(g('net-managers').split(chr(10))[:6])}")
+    s.append(f"tools: {g('userland').split(chr(10))[-1][:200]}")
+    full = [l for l in g('space').split('\n') if re.search(r'\s(9\d|100|8[5-9])%\s', l)]
+    if full:
+        s.append('nearly full: ' + '; '.join(' '.join(l.split()[-2:]) for l in full))
+    ne = [l for l in g('nonstd-exes').split('\n') if l]
+    s.append(f"non-standard executables running ({len(ne)}): {' '.join(ne)[:400]}")
+    failed = [l.split()[0] for l in g('services-failed').split('\n') if l.strip()]
+    if failed:
+        s.append('failed units: ' + ' '.join(failed))
+    return s
+
+
+def cmd_snapshot(a, target, noise):
+    probes = load_probes()
+    if a.only:
+        want = set(a.only.split(','))
+        probes = [p for p in probes if p['name'] in want]
+    run = open_target(target, noise)
+    bid = board_id(run, a.name)
+    st = stamp()
+    sdir = os.path.join(HOME, bid, st)
+    os.makedirs(sdir)
+    meta = {'board': bid, 'target': target, 'noise': noise, 'stamp': st, 'probes': {}}
+    secs = {}
+    with open(os.path.join(sdir, 'snapshot.md'), 'w') as f:
+        f.write(f'# Snapshot {bid} {st} via {target}\n\n')
+        for i, p in enumerate(probes, 1):
+            t0 = time.time()
+            rc, body = run(i, p['cmd'], p['timeout'])
+            dt = round(time.time() - t0, 1)
+            meta['probes'][p['name']] = {'rc': rc, 'seconds': dt}
+            secs[p['name']] = body
+            f.write(f"## {p['name']}  (rc={rc}, {dt}s)\n```\n{body}\n```\n\n")
+            f.flush()
+            print(f"  {p['name']:<18} rc={rc:<3} {dt:>5}s", file=sys.stderr)
+    json.dump(meta, open(os.path.join(sdir, 'meta.json'), 'w'), indent=1)
+    remember_target(os.path.join(HOME, bid), target, noise)
+    print(f'board: {bid}\nsnapshot: {sdir}/snapshot.md')
+    for line in summarize(secs):
+        print(line)
+    bad = [k for k, v in meta['probes'].items() if v['rc'] < 0]
+    if bad:
+        print('timed out: ' + ' '.join(bad))
+    prev = snapshots(bid)
+    if len(prev) > 1:
+        print(f'previous snapshot: {prev[-2]} (discover --diff --name {bid})')
+
+
+def cmd_app(a, target, noise):
+    run = open_target(target, noise)
+    bid = board_id(run, a.name)
+    pat = a.app.replace("'", '')
+    # Skip the searching shell itself: its own cmdline contains the pattern and "/proc/[0-9]".
+    rc, out = run(1, f"for d in /proc/[0-9]*; do c=$(tr '\\0' ' ' 2>/dev/null <$d/cmdline); case $c in *'/proc/[0-9]'*) ;; *'{pat}'*) echo \"${{d#/proc/}} $c\";; esac; done", 30)
+    keep = [tuple(l.split(' ', 1)) for l in out.split('\n') if re.match(r'^\d+ \S', l)]
+    if not keep:
+        sys.exit(f'no process matches {a.app!r}')
+    os.makedirs(os.path.join(HOME, bid, 'apps'), exist_ok=True)
+    path = os.path.join(HOME, bid, 'apps', re.sub(r'\W+', '_', a.app) + '-' + stamp() + '.md')
+    with open(path, 'w') as f:
+        f.write(f'# App deep-dive {a.app!r} on {bid} via {target}\n\n')
+        for p, c in keep[:8]:
+            f.write(f'## pid {p}: {c[:200]}\n\n')
+            for i, (name, tmpl) in enumerate(APP_CMDS, 10):
+                rc, body = run(i, tmpl.format(pid=p), 30)
+                f.write(f'### {name}\n```\n{body}\n```\n\n')
+    remember_target(os.path.join(HOME, bid), target, noise)
+    print(f'{len(keep)} process(es): ' + '; '.join(f'{p} {c[:80]}' for p, c in keep[:8]))
+    print(f'deep-dive: {path}')
+
+
+def normalize(lines, mode):
+    lines = [l for l in lines if l.strip()]
+    if mode == 'cmdonly':
+        lines = [' '.join(l.split()[2:]) for l in lines]
+    if mode == 'lastcol':
+        lines = [re.sub(r'\.\d+$', '', l.split()[-1]) for l in lines]   # rotated logs are not drift
+    if mode in ('sort', 'cmdonly', 'lastcol'):
+        lines = sorted(set(lines))
+    return lines
+
+
+def cmd_diff(a):
+    bid = a.name
+    if not bid:
+        boards = [b for b in os.listdir(HOME) if snapshots(b)] if os.path.isdir(HOME) else []
+        if len(boards) != 1:
+            sys.exit('--diff needs --name ID (boards: ' + ' '.join(boards) + ')')
+        bid = boards[0]
+    snaps = snapshots(bid)
+    old, new = (a.rest + [None, None])[:2]
+    if old and not new:
+        new = snaps[-1]
+    if not old:
+        if len(snaps) < 2:
+            sys.exit(f'{bid}: fewer than two snapshots')
+        old, new = snaps[-2], snaps[-1]
+    modes = {p['name']: p['diff'] for p in load_probes()}
+    A = parse_snapshot(os.path.join(HOME, bid, old))
+    B = parse_snapshot(os.path.join(HOME, bid, new))
+    print(f'# drift {bid}: {old} -> {new}')
+    changed = 0
+    for side, X, Y in ((old, A, B), (new, B, A)):
+        only = [n for n in X if n not in Y]
+        if only:
+            print(f'only in {side} (not compared): ' + ' '.join(only))
+    for name in [n for n in A if n in B]:
+        mode = modes.get(name, 'full')
+        if mode == 'skip':
+            continue
+        la, lb = normalize(A.get(name, []), mode), normalize(B.get(name, []), mode)
+        if la == lb:
+            continue
+        changed += 1
+        print(f'\n## {name}')
+        for l in difflib.unified_diff(la, lb, lineterm='', n=0):
+            if not l.startswith(('---', '+++', '@@')):
+                print(l)
+    if not changed:
+        print('no drift')
+
+
+def cmd_list(a):
+    if not os.path.isdir(HOME):
+        return print('no snapshots yet')
+    for b in sorted(os.listdir(HOME)):
+        if a.name and b != a.name:
+            continue
+        t, _ = saved_target(b)
+        apps = os.listdir(os.path.join(HOME, b, 'apps')) if os.path.isdir(os.path.join(HOME, b, 'apps')) else []
+        print(f'{b}  target={t}  snapshots={" ".join(snapshots(b))}  apps={len(apps)}')
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('-T', '--target')
+    ap.add_argument('--name', help='board id (default: derived from hostname + machine id)')
+    ap.add_argument('--noise', help='drop console lines matching this regex (serial)')
+    ap.add_argument('--only', help='comma-separated probe names')
+    ap.add_argument('--app', metavar='PATTERN')
+    ap.add_argument('--diff', action='store_true')
+    ap.add_argument('--list', action='store_true')
+    ap.add_argument('--probes', action='store_true')
+    ap.add_argument('rest', nargs='*')
+    a = ap.parse_args()
+    if a.probes:
+        for p in load_probes():
+            print(f"{p['name']:<18} {p['diff']:<8} {p['cmd'][:110]}")
+        return
+    if a.list:
+        return cmd_list(a)
+    if a.diff:
+        return cmd_diff(a)
+    st, sn = saved_target(a.name)
+    target = a.target or st or os.environ.get('DEVSH_TARGET')
+    noise = a.noise or (sn if not a.target or a.target == st else None) or os.environ.get('DEVSH_NOISE')
+    if not target:
+        sys.exit('no target: pass -T (serial[:port], ssh:host, adb, local) or set DEVSH_TARGET')
+    if a.app:
+        return cmd_app(a, target, noise)
+    cmd_snapshot(a, target, noise)
+
+
+if __name__ == '__main__':
+    main()
