@@ -4,6 +4,7 @@
 Usage:
   discover [-T TARGET] [--name ID] [--only a,b] [--noise REGEX]     full probe run -> snapshot
   discover [-T TARGET] [--name ID] --app PATTERN                    deep-dive on processes matching PATTERN
+  discover [-T TARGET] [--name ID] --repo [PATH]                   link the workspace at PATH (default .) with the board
   discover --diff [--name ID] [OLD [NEW]]                           drift between two snapshots (default: last two)
   discover --list [--name ID]                                       boards and snapshots on file
   discover --probes                                                 list the probes
@@ -13,6 +14,7 @@ $DEVSH_TARGET. Snapshots go to $BOARD_DISCOVERY_HOME (default ~/.local/state/boa
   <UTC stamp>/snapshot.md   one section per probe, secrets redacted
   <UTC stamp>/meta.json     target, board id, per-probe rc and duration
   apps/<pattern>-<stamp>.md deep-dives
+  repo-map-<stamp>.md       --repo: board artifacts matched to workspace repos, builds and sources
   target                    the last target that reached this board (used by --app/--diff when -T is omitted)
 The board id is hostname plus the first 8 chars of /etc/machine-id (or the device-tree serial), or --name.
 Nothing is written on the board.
@@ -24,6 +26,9 @@ _loader = importlib.machinery.SourceFileLoader('devsh', os.path.join(HERE, 'devs
 _spec = importlib.util.spec_from_loader('devsh', _loader)
 devsh = importlib.util.module_from_spec(_spec)
 _loader.exec_module(devsh)
+
+sys.path.insert(0, os.path.join(HERE, '..', 'lib'))
+import repomap  # noqa: E402
 
 HOME = os.environ.get('BOARD_DISCOVERY_HOME') or os.path.join(
     os.environ.get('XDG_STATE_HOME', os.path.expanduser('~/.local/state')), 'board-discovery')
@@ -195,6 +200,20 @@ def cmd_app(a, target, noise):
     print(f'deep-dive: {path}')
 
 
+def cmd_repo(a, target, noise):
+    run = open_target(target, noise)
+    bid = board_id(run, a.name)
+    path, rows = repomap.repo_map(run, a.repo, bid, os.path.join(HOME, bid))
+    remember_target(os.path.join(HOME, bid), target, noise)
+    for p, art, fp, m in rows:
+        if m['match']:
+            print(f"{m['match'][0]:<14} {p}  <-  {m['match'][1]}")
+        elif m['candidates'] or m['targets']:
+            c = m['candidates'][0] if m['candidates'] else None
+            print(f"{(c[0] if c else 'source only'):<14} {p}  ~  {c[1] if c else 'target ' + m['targets'][0]}")
+    print(f'repo map: {path}')
+
+
 def normalize(lines, mode):
     lines = [l for l in lines if l.strip()]
     if mode == 'cmdonly':
@@ -264,6 +283,7 @@ def main():
     ap.add_argument('--noise', help='drop console lines matching this regex (serial)')
     ap.add_argument('--only', help='comma-separated probe names')
     ap.add_argument('--app', metavar='PATTERN')
+    ap.add_argument('--repo', nargs='?', const='.', metavar='PATH')
     ap.add_argument('--diff', action='store_true')
     ap.add_argument('--list', action='store_true')
     ap.add_argument('--probes', action='store_true')
@@ -284,6 +304,8 @@ def main():
         sys.exit('no target: pass -T (serial[:port], ssh:host, adb, local) or set DEVSH_TARGET')
     if a.app:
         return cmd_app(a, target, noise)
+    if a.repo:
+        return cmd_repo(a, target, noise)
     cmd_snapshot(a, target, noise)
 
 

@@ -13,6 +13,7 @@ Two tools in `bin/` next to this file (Claude Code: `~/.claude/skills/board-disc
 | `devsh -T TARGET CMD...` | runs shell commands on the target, prints `### CMD [rc=N]` + output, redacts `key=secret` values |
 | `discover -T TARGET` | runs `lib/probes.txt` (~30 read-only probes, BusyBox safe) and saves a snapshot for the board |
 | `discover --app PATTERN` | deep-dive on matching processes: cmdline, parents/children, systemd unit + drop-ins, environment (redacted), open files, own libraries, sockets |
+| `discover --repo [PATH]` | links the workspace at PATH (default `.`: the repo, its submodules and nested repos) with the board: each product file on the board is matched to a local file as `identical` (sha256), `same build-id` (ELF, survives stripping), `same runtime only` (AppImage-like payload differs) or `differs`, plus build targets that declare it, versions in board paths traced to a tag or commit (and how far HEAD is ahead), repo files that reference board locations (deploy scripts, constants) and board units against the repo's unit files |
 | `discover --diff [OLD [NEW]]` | drift between snapshots of one board (volatile probes skipped, pids/sizes ignored) |
 | `discover --list` | boards and snapshots on file (`$BOARD_DISCOVERY_HOME`, default `~/.local/state/board-discovery`) |
 
@@ -33,15 +34,20 @@ board, so `--app`/`--diff` with `--name <board id>` need no `-T`.
 3. **Deep-dive** every product process (the "non-standard executables", custom units, children of a launcher):
    `discover --name <id> --app <exe name>`. Follow `reference/method.md` to go from processes to units, config,
    logs, databases, IPC, update path and network setup, with targeted read-only `devsh` commands.
-4. **Interview** the user only for what the board cannot tell (method.md, "Ask the user"): purpose of each
+4. **Link the workspace** when a project repo is open: `discover --name <id> --repo <repo root>` (~20 s over ssh;
+   over serial console noise can spoil a few ELF dumps, so fewer build-id matches). Read `repo-map-*.md`: it says
+   which local build or package each board file came from, which source repo builds it, whether the board runs
+   the checkout's version, and which repo files (deploy scripts, launcher constants) own the board paths.
+5. **Interview** the user only for what the board cannot tell (method.md, "Ask the user"): purpose of each
    component, physical side effects, safe restart, build and deploy from the host project, which facts are
    per-unit versus per-product.
-5. **Generate the board skill** from `templates/board-skill/` (method.md, "Generate"): `SKILL.md` and
+6. **Generate the board skill** from `templates/board-skill/` (method.md, "Generate"): `SKILL.md` and
    `reference/` files. It calls `devsh` through a one-line shell function with the target and noise; do not
    copy or wrap the transport in a project-named script. Put it where the user keeps
    project skills, not in this repo. Each fact carries "verified on <board id>, <date>".
-6. **Re-check later.** Before relying on an older board skill, or before and after a deploy or test:
-   `discover -T … && discover --diff --name <id>`. Fold confirmed drift into the board skill, and report the rest
+7. **Re-check later.** Before relying on an older board skill, or before and after a deploy or test:
+   `discover -T … && discover --diff --name <id>`, and `--repo` to see whether a deploy landed (the new build's
+   files turn `identical`/`same build-id`). Fold confirmed drift into the board skill, and report the rest
    (leftover test trees, changed unit drop-ins, full disks) to the user.
 
 ## Rules

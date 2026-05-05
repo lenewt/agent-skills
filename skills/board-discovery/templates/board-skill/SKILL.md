@@ -24,9 +24,9 @@ verified on {{board id}}, {{date}}.
 
 ## Component map
 
-| Piece | Where | Started by |
-|---|---|---|
-| {{component}} | {{path}} | {{unit or parent}} |
+| Piece | Where | Started by | Built from |
+|---|---|---|---|
+| {{component}} | {{path}} | {{unit or parent}} | {{repo, target, local output (discover --repo)}} |
 
 Restart: {{command, duration, what else it restarts}}. Stop for a quiet console: {{command}}.
 

@@ -23,7 +23,8 @@ timestamp prefix '^\\d\\d/\\d\\d/\\d{4} ').
 """
 import argparse, glob, os, re, shlex, subprocess, sys, time
 
-SECRET = re.compile(r'(?i)\b([\w.-]*(?:passw(?:or)?d|passphrase|secret|token|api[_-]?key|psk|private[_-]?key|credential)[\w.-]*'
+# Bounded name parts: an unbounded [\w.-]* backtracks quadratically on long word-like lines (hex/octal dumps).
+SECRET = re.compile(r'(?i)\b([\w.-]{0,40}(?:passw(?:or)?d|passphrase|secret|token|api[_-]?key|psk|private[_-]?key|credential)[\w.-]{0,40}'
                     r'["\']?\s*[=:]\s*)("[^"]*"|\'[^\']*\'|\S+)')
 
 
@@ -172,6 +173,11 @@ class Subproc:
 
     def open(self):
         rc, out = self.run(0, 'true', 15)
+        if rc != 0 and self.kind == 'ssh':
+            # A hung multiplexing master blocks every new session: close it and retry once.
+            subprocess.run(self.base[:-1] + ['-O', 'exit', self.base[-1]], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=10)
+            rc, out = self.run(0, 'true', 15)
         if rc != 0:
             print(f'!! {self.kind} target unreachable: {out.strip()}', file=sys.stderr)
         return rc == 0
