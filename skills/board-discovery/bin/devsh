@@ -70,6 +70,7 @@ class Serial:
         except ImportError:
             sys.exit('devsh: pyserial missing (pip install pyserial)')
         self.serial, self.user, self.o, self.s = serial, user, o, None
+        self.seen = b''   # last console bytes of a failed open, for the error message
 
     def _read_until(self, pats, t):
         end, buf = time.time() + t, b''
@@ -105,12 +106,18 @@ class Serial:
         return False
 
     def _open(self):
-        # Leave a possible pager or half-typed line, then look for a login or shell prompt.
+        # Leave a possible pager ('q'), then kill the half-typed line (^U): at a getty login prompt
+        # the 'q' would otherwise be submitted as a user name. Then look for a login or shell prompt.
         self.s.write(b'q')
         time.sleep(0.2)
-        self.s.write(b'\x03\n')
+        self.s.write(b'\x15\x03\n')
         self.s.flush()
-        buf, p = self._read_until([rb'login: ?$', self.PROMPT], 3)
+        buf, p = self._read_until([rb'login: ?$', self.PROMPT, rb'[Pp]assword: ?$'], 3)
+        if p == rb'[Pp]assword: ?$':
+            # A stray user name reached login (left by an earlier session): abort it and wait out
+            # login's fail delay for the next prompt.
+            self._send('')
+            buf, p = self._read_until([rb'login: ?$'], 10)
         if p == rb'login: ?$' or (p is None and b'login:' in buf[-200:]):
             self._send(self.user)
             buf, p = self._read_until([rb'[Pp]assword: ?$', self.PROMPT], 5)
@@ -119,10 +126,12 @@ class Serial:
                 buf, p = self._read_until([self.PROMPT, rb'incorrect'], 8)
                 if p != self.PROMPT:
                     print('!! serial login failed (set DEVSH_PASSWORD?)', file=sys.stderr)
+                    self.seen = buf
                     return False
             time.sleep(0.5)
             self.s.read(65536)
         elif p is None:
+            self.seen = buf
             return False
         self._send('stty -echo 2>/dev/null; export PAGER=cat SYSTEMD_PAGER=cat')
         self._read_until([self.PROMPT], 2)
@@ -228,7 +237,11 @@ def main():
     if not a.cmds:
         ap.error('no command')
     if not t.open():
-        print(f'!! no shell on {a.target} (powered, cabled, right port/baud/host?)', file=sys.stderr)
+        print(f'!! no shell on {a.target} (powered, cabled, right port/baud/host? still booting?)', file=sys.stderr)
+        seen = getattr(t, 'seen', b'')
+        if seen:
+            tail = seen.decode('utf-8', 'replace').replace('\r', '').strip()[-200:]
+            print(f'!! last console output: {tail!r}', file=sys.stderr)
         return 2
     noise = re.compile(a.noise) if a.noise else None
     worst = 0

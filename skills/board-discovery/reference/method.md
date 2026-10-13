@@ -11,7 +11,9 @@ Work from what runs to where it comes from. For each product component, find:
 | Its files | exe dir, `cwd`, the "libraries" outside system dirs, open files (configs, DBs, logs, ttys, sockets), `ls -la` of each dir found |
 | Configuration | open or nearby `*.ini/*.conf/*.json/*.xml`, the unit `Environment=`/`EnvironmentFile=`, flags files read at start; list them, read non-secret ones |
 | Data | `databases` probe + open files; for SQLite: `sqlite3 -readonly <db> .tables` (schema only, no rows unless the user asks); which file is live vs factory/backup; WAL present (do not copy without stopping the writer) |
-| Logs | open log files, `logs` probe (size + date shows which are active), `journalctl -u <unit> -n 50 --no-pager`, `StandardOutput=tty` (logs on the serial console) |
+| Logs | open log files, `logs` probe (size + date shows which are active), `journalctl -u <unit> -n 50 --no-pager`, `StandardOutput=tty` (logs on the serial console). A log file that exists but stays at 0 bytes, or is not updated while the app runs, means the product logs somewhere else (tty, journal, a debug flag that enables file logging): record the channel that really carries the log and how to capture it, because test harnesses that grep files will see nothing |
+| Removable media and imports | how the product finds removable media (automounter: udisks, usbmount, devmon/udevil, udev rules; mount point; filesystem and device-name rules the app applies, e.g. "vfat on /dev/sd*"), and how to simulate one for tests without hardware (a filesystem image on a loop device, with a device node named the way the app expects); where imported files are copied and how much space that takes |
+| Bare or reflashed state | what a system flash replaces and what survives (per partition); the cheapest fingerprint that changes on a reflash (system/OS version file, rootfs build stamp); what a freshly flashed board is missing (product trees, side tools the launcher needs) |
 | IPC and ports | `listening` probe, open sockets/FIFOs, D-Bus policy files (`/etc/dbus-1/system.d/`), named pipes next to the exe |
 | Display and input | `display` probe: X or Wayland, DISPLAY, resolution and rotation, which window/process is on top, touch device |
 | Network setup | the manager in `net-managers`, profile names, udev renames (`net-naming`), whether the product rewrites the network config at start (profiles with recent mtimes, the app opening NetworkManager D-Bus) |
@@ -19,6 +21,10 @@ Work from what runs to where it comes from. For each product component, find:
 | Update and deploy path | `update` probe, updater units and scripts (read them), removable-media automount, partitions: what survives an update (separate data partition?), free space where a deploy would land |
 | Restart and recovery | unit `Restart=`, watchdog, which units are `BindsTo`/`Requires`, how long a restart takes (ask before trying) |
 | Leftovers and drift | non-standard dirs in `apps-dirs`, drop-ins that override packaged units, backup copies of DBs, test trees: compare with what the user expects |
+
+Pitfalls when probing over ssh: `pgrep -f PATTERN` also matches the `sh -c` wrapper that carries your own command
+(use `ps -eo pid,etime,args | grep '[P]ATTERN'`); BusyBox images often lack `timeout`, `mkfs.*`, `mtools`, so prepare
+images and timeouts on the host.
 
 Stop digging a component once you can answer: how to stop/start it, where its binary/config/data/logs are, how to
 replace it with a new build, and how to see that it is healthy.
@@ -61,6 +67,13 @@ Copy `templates/board-skill/` to the user's project skills directory as `<produc
   value seen once. Stable facts (paths, unit names, partition roles): write the value.
 - Mark anything inferred and not verified as such. Never include redacted values, keys or customer data.
 - Add a "Drift check" line: `discover -T <target> && discover --diff --name <board id>` from board-discovery.
+- Add a **freshness check** near the top: one cheap `D '…'` command (system/OS version file plus `ls` of the product
+  dirs) with the value seen, and what to do when it differs (the board was reflashed: drift check, then the bare-board deploy).
+- Name the console adapter by its `/dev/serial/by-id/` path, not `ttyUSBn`.
+- List notable **absent** tools next to the present ones (they decide how tests and deploys must be done).
+- `reference/build-deploy.md` covers both an incremental deploy **and** a from-scratch one for a bare board: every
+  component, where each artifact comes from (build output, package store, pinned versions), and the side files a
+  launcher needs. Note test helpers that need no hardware (simulated removable media, simulated buses) when discovery found them.
 - Reuse what the project already has: a skill that exists already (update it rather than writing a second one),
   existing scripts in the project repo for deploy or flashing (reference them, do not copy them).
 

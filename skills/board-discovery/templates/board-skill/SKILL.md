@@ -11,11 +11,14 @@ exit code. Define it at the top of each command block, then `D CMD [CMD...]` (`T
 Drift check: `discover -T {{target}} && discover --diff --name {{board id}}` (board-discovery). Facts below were
 verified on {{board id}}, {{date}}.
 
+**Freshness check first.** `D '{{version file}}; ls {{product dirs}}'` should print {{value seen}}. If not, the board
+was reflashed or changed: run the drift check, and use the bare-board deploy in `reference/build-deploy.md`.
+
 ## Connect
 
-- Console `{{console device}}` at {{baud}} 8N1, host adapter {{/dev/ttyUSBn, chip}}. Login `{{user}}`, {{password policy}}.
+- Console `{{console device}}` at {{baud}} 8N1, host adapter {{chip}} at `/dev/serial/by-id/{{adapter}}` (`ttyUSBn` numbers move). Login `{{user}}`, {{password policy}}.
 - {{console noise and the --noise regex}}
-- Userland: {{BusyBox/bash, notable missing or present tools}}.
+- Userland: {{BusyBox/bash}}. Present: {{tools}}. Absent: {{tools that change how tests and deploys are done}}.
 - Identity check: `D 'hostname; {{version file}}'`.
 
 ## Network
@@ -33,7 +36,7 @@ Restart: {{command, duration, what else it restarts}}. Stop for a quiet console:
 ## Data and logs
 
 - {{live config/DB paths, how the live one is selected}}
-- {{log paths, which one shows what}}
+- {{log paths, which one shows what; which channel really carries the app log (file, journal, console) and how to capture it}}
 
 ## Safety
 

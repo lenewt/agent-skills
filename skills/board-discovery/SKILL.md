@@ -14,18 +14,23 @@ Two tools in `bin/` next to this file (Claude Code: `~/.claude/skills/board-disc
 | `discover -T TARGET` | runs `lib/probes.txt` (~30 read-only probes, BusyBox safe) and saves a snapshot for the board |
 | `discover --app PATTERN` | deep-dive on matching processes: cmdline, parents/children, systemd unit + drop-ins, environment (redacted), open files, own libraries, sockets |
 | `discover --repo [PATH]` | links the workspace at PATH (default `.`: the repo, its submodules and nested repos) with the board: each product file on the board is matched to a local file as `identical` (sha256), `same build-id` (ELF, survives stripping), `same runtime only` (AppImage-like payload differs) or `differs`, plus build targets that declare it, versions in board paths traced to a tag or commit (and how far HEAD is ahead), repo files that reference board locations (deploy scripts, constants) and board units against the repo's unit files |
-| `discover --diff [OLD [NEW]]` | drift between snapshots of one board (volatile probes skipped, pids/sizes ignored) |
+| `discover --diff [OLD [NEW]]` | drift between snapshots of one board (volatile probes skipped, pids/sizes/`ls` dates ignored); `OLD` may be `<board id>/<stamp>` to compare across ids |
 | `discover --list` | boards and snapshots on file (`$BOARD_DISCOVERY_HOME`, default `~/.local/state/board-discovery`) |
 
-TARGET (or `$DEVSH_TARGET`): `serial[:/dev/ttyUSB1][@115200]` (no port: the first ttyUSB/ttyACM that answers),
-`ssh:[user@]host[:port]`, `adb[:serial]`, `local`. User `$DEVSH_USER` (root), serial password `$DEVSH_PASSWORD`.
+TARGET (or `$DEVSH_TARGET`): `serial[:/dev/serial/by-id/<adapter>][@115200]` (no port: the first ttyUSB/ttyACM that
+answers; `ttyUSBn` numbers move with replugs, the `/dev/serial/by-id/` path does not),
+`ssh:[user@]host[:port]`, `adb[:serial]`, `local`. The board id is the hostname plus a hash of a hardware identity
+(device-tree serial, else the eMMC CID), so it survives a reflash; boards without one fall back to `/etc/machine-id`,
+which a reflash regenerates (then the reflashed board shows up as a new id: diff across ids with `<id>/<stamp>`). User `$DEVSH_USER` (root), serial password `$DEVSH_PASSWORD`.
 `--noise REGEX` drops console spam lines (services that log to the tty). `discover` remembers the last target per
 board, so `--app`/`--diff` with `--name <board id>` need no `-T`.
 
 ## Workflow
 
 1. **Reach a shell.** Ask the user how the board is connected if unknown. Try `devsh -T serial --check`
-   (bootstrap, works without network) or `devsh -T ssh:<ip> --check`. On a serial console that prints service logs,
+   (bootstrap, works without network) or `devsh -T ssh:<ip> --check`. On "no shell", read the "last console output"
+   line: nothing at all means a wrong port, no power or a board still booting (a fresh flash can take minutes, so retry);
+   a login or password prompt that did not take means a login problem, not cabling. `ls -l /dev/serial/by-id/` names the adapter. On a serial console that prints service logs,
    look at a few raw lines and pass `--noise '<timestamp prefix regex>'`. Prefer ssh once the network is up: it is
    faster (~15 s per snapshot against ~25 s) and free of console noise.
 2. **Snapshot.** `discover -T <target>`. Read the printed headline (OS, init, network managers, near-full disks,
@@ -45,7 +50,8 @@ board, so `--app`/`--diff` with `--name <board id>` need no `-T`.
    `reference/` files. It calls `devsh` through a one-line shell function with the target and noise; do not
    copy or wrap the transport in a project-named script. Put it where the user keeps
    project skills, not in this repo. Each fact carries "verified on <board id>, <date>".
-7. **Re-check later.** Before relying on an older board skill, or before and after a deploy or test:
+7. **Re-check later.** Start every session that uses an older board skill with its freshness check (one cheap
+   identity command, see Generate): a reflash can wipe the product, test trees and drop-ins. Before and after a deploy or test:
    `discover -T … && discover --diff --name <id>`, and `--repo` to see whether a deploy landed (the new build's
    files turn `identical`/`same build-id`). Fold confirmed drift into the board skill, and report the rest
    (leftover test trees, changed unit drop-ins, full disks) to the user.
