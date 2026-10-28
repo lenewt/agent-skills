@@ -66,7 +66,9 @@ Target: <profile name>
 ```
 
 - **No source**: no file paths, code identifiers or code fences. `bin/e2e-lint.sh` refuses them (plus the profile's
-  `LINT_PATTERNS`). Describe what a person at the screen sees; put protocol evidence in log patterns.
+  `LINT_PATTERNS`). Describe what a person at the screen sees; put protocol evidence in log patterns. Words such as
+  "return", "import" or "class" are fine in prose: the lint refuses only code shapes (`return x;`, `void f(`,
+  `class X {`). `tests/lint-cases.sh` checks both.
 - Name controls by their look and position ("the rightmost of the three layout icons"). If a step is *meant* to be
   refused, say so explicitly, or a careful model will skip it to obey Safety.
 - 3 to 15 steps, each with one observable criterion; at most 12000 bytes. Example: `templates/scenario.example.md`.

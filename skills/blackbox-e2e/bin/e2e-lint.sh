@@ -10,14 +10,20 @@ hit() { echo "lint: $*"; hits=$((hits + 1)); }
 
 extra=()
 for re in "$@"; do extra+=(-e "$re"); done
+# Keywords hit only in code shape, so prose such as "return to the grid" or "the import entry" passes.
+name='[A-Za-z_][A-Za-z0-9_]*'
+keyword_code=(
+    -e "\b(void|const|class|struct|function|def|emit)[[:space:]]+([A-Za-z_&*][A-Za-z0-9_&*<>:]*[[:space:]]+)?[&*]?$name(\(|[[:space:]]*(\{|=[^=]|:[[:space:]]*(public|private|protected)\b))"
+    -e '\breturn[[:space:]]+[^[:space:];]+;' -e '\b(return|emit)[[:space:]]*\('
+    -e "\bimport[[:space:]]+$name(\.$name)+" -e "\bimport[[:space:]]+[A-Z]$name[[:space:]]+[0-9]"
+    -e '\b(Q_INVOKABLE|Q_PROPERTY)\b')
 # Source-shaped content. Log-pattern lines may hold regex syntax but not code.
 # E2E_LINT_STRUCTURE_ONLY=1 (white-box runs, where the tester may read the source) skips it.
 [ "${E2E_LINT_STRUCTURE_ONLY:-0}" = 1 ] ||
 while IFS= read -r m; do hit "source-like content: $m"; done < <(grep -nE \
     -e '```' -e '#include' -e '::' -e '(^|[^A-Za-z])src/' -e '/home/' -e '/Users/' \
     -e '\.(c|cc|cpp|h|hpp|qml|js|jsx|ts|tsx|py|java|kt|go|rs|pro|pri|qrc|gradle|cmake)\b' \
-    -e '\b(void|const|return|class|struct|function|def|import|emit|Q_INVOKABLE|Q_PROPERTY)\b[[:space:]]*[A-Za-z(<{]' \
-    -e '\b[a-z]+[A-Z][A-Za-z]*\(\)' \
+    "${keyword_code[@]}" -e '\b[a-z]+[A-Z][A-Za-z]*\(\)' \
     "${extra[@]}" "$f")
 
 grep -qE '^# Scenario: .+' "$f" || hit "missing '# Scenario: <title>'"
