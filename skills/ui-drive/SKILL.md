@@ -5,7 +5,7 @@ description: Autonomously drive and visually verify GUIs on X11 (Qt, GTK, any to
 
 # ui-drive: drive machine UIs locally or on embedded boards
 
-The tool is `~/.claude/skills/ui-drive/bin/uidrive` (self-contained bash; run it with an
+The tool is `bin/uidrive` in this skill's folder (self-contained bash; run it with an
 absolute path or add to PATH). It abstracts one loop over any X11 target:
 **screenshot → Read the image → tap/swipe → screenshot → verify**.
 
@@ -62,7 +62,7 @@ Run `uidrive -h` for the full command list: `geom`, `shot`, `record`, `tap`, `sw
 
 Board smoke test:
 ```bash
-UID=~/.claude/skills/ui-drive/bin/uidrive
+UID=<this skill's folder>/bin/uidrive
 $UID -t root@<ip> geom
 $UID -t root@<ip> shot /tmp/.../s0.png          # Read it, pick coordinates
 $UID -t root@<ip> tap 605 1249                  # reversible control first

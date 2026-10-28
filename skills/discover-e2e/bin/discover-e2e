@@ -21,7 +21,6 @@ set -euo pipefail
 
 SKILL="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 BB=${BLACKBOX_E2E:-$SKILL/../blackbox-e2e}
-[ -x "$BB/bin/e2e-run.sh" ] || BB=$HOME/.claude/skills/blackbox-e2e
 [ -x "$BB/bin/e2e-run.sh" ] || { echo "blackbox-e2e not found (set BLACKBOX_E2E)" >&2; exit 2; }
 BB=$(cd "$BB" && pwd)
 

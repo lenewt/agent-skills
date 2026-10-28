@@ -2,5 +2,5 @@
 blackbox-e2e  claude,copilot
 whitebox-e2e  claude,copilot
 discover-e2e  claude,copilot
-ui-drive      claude
+ui-drive      claude,copilot
 board-discovery claude,copilot

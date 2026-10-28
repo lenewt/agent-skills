@@ -7,7 +7,7 @@ description: Operate {{product}} target boards ({{board model / SoC}}, {{distro}
 
 Tool: `devsh` from the `board-discovery` skill runs shell commands on the board and prints each output with its
 exit code. Define it at the top of each command block, then `D CMD [CMD...]` (`T=ssh:<ip> D …` once the network is up):
-`D() { ~/.claude/skills/board-discovery/bin/devsh -T "${T:-{{target}}}" {{--noise '<regex>'}} "$@"; }` References: `reference/layout.md` (components, units, files, DBs, logs){{, reference/networking.md}}{{, reference/build-deploy.md}}.
+`D() { {{devsh path}} -T "${T:-{{target}}}" {{--noise '<regex>'}} "$@"; }` References: `reference/layout.md` (components, units, files, DBs, logs){{, reference/networking.md}}{{, reference/build-deploy.md}}.
 Drift check: `discover -T {{target}} && discover --diff --name {{board id}}` (board-discovery). Facts below were
 verified on {{board id}}, {{date}}.
 

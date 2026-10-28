@@ -3,10 +3,9 @@
 # profile. Process helpers keep their state in $E2E_PRIV (pids, *.out, log offsets).
 
 # uidrive (ui-drive skill): $UIDRIVE, else next to this skill in the same repo (resolved through
-# the install symlinks, so it works whichever tools the skills are linked into), else installed or on PATH.
+# the install symlinks, so it works whichever tools the skills are linked into), else on PATH.
 if [ -z "${UIDRIVE:-}" ]; then
     for UIDRIVE in "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../../ui-drive/bin/uidrive" \
-                   "$HOME/.claude/skills/ui-drive/bin/uidrive" "$HOME/.copilot/skills/ui-drive/bin/uidrive" \
                    "$(command -v uidrive 2> /dev/null || true)"; do
         [ -x "$UIDRIVE" ] && break
     done

@@ -5,6 +5,8 @@ description: Black-box end-to-end test of any GUI application (local X11 under X
 
 # blackbox-e2e: black-box E2E through a separate, locked-down tester
 
+Paths in this file (`bin/…`, `templates/…`, `../<skill>/…`) are relative to this skill's folder, wherever it is installed.
+
 You (the dev session) **author** a behavioural scenario. `bin/e2e-run.sh` **runs** it in a fresh, headless tester
 whose only tools are `e2e <verb>` (a shim on its PATH) and a file viewer limited to its own screenshots. The tester
 never sees the code, the paths or the build. A **profile** adapts the target app: how to start and stop it, where
@@ -48,7 +50,7 @@ Never write steps from memory, the DB or translation files: labels, screens and 
 after you see them. Explore first, which costs nothing (no tester):
 
 ```bash
-~/.claude/skills/blackbox-e2e/bin/e2e-run.sh draft.md --fixtures f.sql --explore [--explore-fixture NAME]...
+bin/e2e-run.sh draft.md --fixtures f.sql --explore [--explore-fixture NAME]...
 ```
 
 It starts the stack with the `setup` fixture, saves `shots/start.png`, then applies each `--explore-fixture` in
@@ -84,10 +86,10 @@ Target: <profile name>
 ## 3. Run
 
 ```bash
-~/.claude/skills/blackbox-e2e/bin/e2e-run.sh <scenario.md> [--profile NAME|FILE] [--host U@H] [--set k=v]... \
+bin/e2e-run.sh <scenario.md> [--profile NAME|FILE] [--host U@H] [--set k=v]... \
     [--fixtures f.sql] [--engine claude|copilot] [--model M] [--budget USD] [--out DIR] [--source DIR]
 # e.g. the demo:
-~/.claude/skills/blackbox-e2e/bin/e2e-run.sh ~/.claude/skills/blackbox-e2e/templates/scenario.example.md \
+bin/e2e-run.sh templates/scenario.example.md \
     --set cmd="xcalc -geometry 400x560+0+0" --set size=400x560 --set desc="a desktop calculator (xcalc)"
 ```
 
@@ -112,7 +114,7 @@ Limits (env overrides): `E2E_BUDGET` USD 4, `E2E_MAX_CALLS` 120, `E2E_MAX_SHOTS`
 `wait` ≤ 180 s, `log` ≤ 100 lines (800 chars each). Teardown runs on every exit.
 
 `--source DIR` switches to **white-box** mode (Copilot only): the tester may also read DIR. Use the
-`whitebox-e2e` skill for it (`~/.claude/skills/whitebox-e2e/SKILL.md`); without `--source` nothing changes.
+`whitebox-e2e` skill for it (`../whitebox-e2e/SKILL.md`); without `--source` nothing changes.
 
 `--scout DIR` (with `--engine copilot --source`) runs a **scout** that drafts a scenario instead of judging one. Do not
 call it directly: the `discover-e2e` skill wraps it. The scout gets three extra verbs, refused in other modes:

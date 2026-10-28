@@ -15,4 +15,4 @@ case " $* " in
         [ -n "$SRC" ] || { echo "whitebox-e2e: not in a git checkout; pass --source DIR" >&2; exit 2; }
         src=(--source "$SRC") ;;
 esac
-exec "$HOME/.claude/skills/blackbox-e2e/bin/e2e-run.sh" "$SCEN" --engine copilot "${src[@]}" "$@"
+exec "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../../blackbox-e2e/bin/e2e-run.sh" "$SCEN" --engine copilot "${src[@]}" "$@"

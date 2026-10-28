@@ -5,6 +5,8 @@ description: Draft a black-box E2E scenario (steps, log patterns, SQL fixtures, 
 
 # discover-e2e: let a cheap scout write the E2E scenario
 
+Paths in this file (`bin/…`, `templates/…`, `../<skill>/…`) are relative to this skill's folder, wherever it is installed.
+
 A blackbox-e2e tester run costs about $0.005. Writing its scenario in the dev session costs orders of magnitude more:
 every screenshot, log grep and SQL try is one more call on a context of several hundred thousand tokens (one measured run: Opus
 calls at $0.4–0.9 each, dozens of them). `bin/discover-e2e` moves that exploration into a **scout**: a separate
@@ -18,7 +20,7 @@ is wrong, rerun the scout with a sharper `--goal` or `--ticket`, or edit the dra
 ## Run
 
 ```bash
-~/.claude/skills/discover-e2e/bin/discover-e2e --profile NAME|FILE [--change RANGE] [--goal "…"] [--ticket FILE] \
+bin/discover-e2e --profile NAME|FILE [--change RANGE] [--goal "…"] [--ticket FILE] \
   [--source DIR] [--host U@H] [--set KEY=VALUE]... [--model claude-sonnet-5.5] [--budget USD] [--out DIR] [--verify]
 ```
 
@@ -61,7 +63,7 @@ Each profile has a product map (`PRODUCT_MAP`, default `$STATE_DIR/maps/<profile
 scout reads it first and proposes additions with evidence. Accept the ones you trust:
 
 ```bash
-discover-e2e --accept-map DRAFT_DIR [--only 1,3]
+bin/discover-e2e --accept-map DRAFT_DIR [--only 1,3]
 ```
 
 The map's `## Safety` section is copied into every task: its `rect:` lines bind the scout as they bind the tester.

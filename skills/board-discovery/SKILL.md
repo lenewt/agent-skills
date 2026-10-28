@@ -5,7 +5,7 @@ description: Discover everything useful about an embedded Linux target board or 
 
 # board-discovery: inventory a target board, then write its skill
 
-Two tools in `bin/` next to this file (Claude Code: `~/.claude/skills/board-discovery/bin/`), Python 3 on the host,
+Two tools in `bin/` next to this file, Python 3 on the host,
 `pyserial` for serial targets. Nothing is installed or written on the board.
 
 | Tool | Does |
@@ -47,7 +47,8 @@ board, so `--app`/`--diff` with `--name <board id>` need no `-T`.
    component, physical side effects, safe restart, build and deploy from the host project, which facts are
    per-unit versus per-product.
 6. **Generate the board skill** from `templates/board-skill/` (method.md, "Generate"): `SKILL.md` and
-   `reference/` files. It calls `devsh` through a one-line shell function with the target and noise; do not
+   `reference/` files. It calls `devsh` through a one-line shell function with the target and noise
+   (`{{devsh path}}`: the absolute path of this skill's `bin/devsh`, as installed); do not
    copy or wrap the transport in a project-named script. Put it where the user keeps
    project skills, not in this repo. Each fact carries "verified on <board id>, <date>".
 7. **Re-check later.** Start every session that uses an older board skill with its freshness check (one cheap

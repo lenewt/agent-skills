@@ -5,13 +5,15 @@ description: White-box end-to-end test of a GUI application by a separate Copilo
 
 # whitebox-e2e: E2E with read-only source access (Copilot CLI only)
 
-This is `blackbox-e2e` in white-box mode. Read `~/.claude/skills/blackbox-e2e/SKILL.md` first: profiles, scenario
+Paths in this file (`bin/…`, `templates/…`, `../<skill>/…`) are relative to this skill's folder, wherever it is installed.
+
+This is `blackbox-e2e` in white-box mode. Read the sibling skill's `../blackbox-e2e/SKILL.md` first: profiles, scenario
 format, limits, report and engines are the same. Only the differences are below.
 
 ## Run
 
 ```bash
-~/.claude/skills/whitebox-e2e/bin/e2e-run.sh <scenario.md> [--source DIR] [--profile …] [--set k=v]… \
+bin/e2e-run.sh <scenario.md> [--source DIR] [--profile …] [--set k=v]… \
     [--fixtures f.sql] [--model M] [--budget USD]
 ```
 
