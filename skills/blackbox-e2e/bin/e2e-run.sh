@@ -6,10 +6,18 @@
 #
 #   e2e-run.sh SCENARIO.md [--profile NAME|FILE] [--host USER@HOST] [--set KEY=VALUE]...
 #              [--fixtures FILE.sql] [--engine claude|copilot] [--model M] [--budget USD]
-#              [--out DIR] [--source DIR]
+#              [--out DIR] [--source DIR] [--explore [--explore-fixture NAME]...] [--scout DIR]
+#
+# --explore is for the author, before writing the steps: no tester and no cost. It starts the
+# stack (with the setup fixture), saves shots/start.png, then applies each --explore-fixture
+# in order and saves shots/after-NAME.png. Write steps against what those screenshots show.
 #
 # --source DIR is white-box mode (Copilot only): the tester may also read DIR (file viewer,
 # grep, glob, `e2e git log|show|diff|blame|grep`), still without writing or running anything.
+#
+# --scout DIR is discovery mode (discover-e2e skill, Copilot + --source only): SCENARIO.md is a
+# task stub, DIR holds brief.md and draft.schema.json, the scout gets extra verbs (grep, sql,
+# try-action), and the run writes <run>/draft.json instead of a verdict.
 #
 # The profile defaults to the scenario's "Target: <name>", looked up in $E2E_PROFILE_PATH
 # (colon-separated dirs), then in this skill's profiles/. Prints the per-step verdict, the
@@ -20,9 +28,9 @@ set -euo pipefail
 BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL="$(dirname "$BIN")"
 
-usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 SCEN=${1:-}; [ -f "$SCEN" ] || usage; shift
-PROFILE_ARG="" FIXTURES_IN="" OUT="" SOURCE="" BUDGET=${E2E_BUDGET:-4} ENGINE=${E2E_ENGINE:-claude} MODEL=${E2E_MODEL:-}
+PROFILE_ARG="" FIXTURES_IN="" OUT="" SOURCE="" EXPLORE=0 EXPLORE_FIXTURES=() SCOUT="" BUDGET="" ENGINE=${E2E_ENGINE:-} MODEL=${E2E_MODEL:-}
 export E2E_HOST=${E2E_HOST:-}
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -37,9 +45,23 @@ while [ $# -gt 0 ]; do
         --budget)   BUDGET=$2; shift 2 ;;
         --out)      OUT=$2; shift 2 ;;
         --source)   SOURCE=$(cd "$2" && pwd) || exit 2; shift 2 ;;
+        --explore)  EXPLORE=1; shift ;;
+        --explore-fixture) EXPLORE=1; EXPLORE_FIXTURES+=("$2"); shift 2 ;;
+        --scout)    SCOUT=$(cd "$2" && pwd) || exit 2; shift 2 ;;
         *) usage ;;
     esac
 done
+if [ -n "$SCOUT" ]; then
+    ENGINE=${ENGINE:-copilot}
+    if [ "$ENGINE" != copilot ] || [ -z "$SOURCE" ] || [ "$EXPLORE" = 1 ]; then
+        echo "--scout needs --engine copilot and --source, without --explore" >&2; exit 2
+    fi
+    if [ ! -f "$SCOUT/brief.md" ] || [ ! -f "$SCOUT/draft.schema.json" ]; then
+        echo "--scout: DIR lacks brief.md or draft.schema.json" >&2; exit 2
+    fi
+    BUDGET=${BUDGET:-${E2E_SCOUT_BUDGET:-0.5}}
+fi
+ENGINE=${ENGINE:-claude} BUDGET=${BUDGET:-${E2E_BUDGET:-4}}
 case "$ENGINE" in
     claude)  MODEL=${MODEL:-haiku} ;;
     copilot) MODEL=${MODEL:-gpt-6-luna} ;;
@@ -54,6 +76,7 @@ if [ -n "$SOURCE" ]; then
     MODE=white-box
     export E2E_LINT_STRUCTURE_ONLY=1
 fi
+[ -z "$SCOUT" ] || MODE=scout
 [ -z "$E2E_HOST" ] || [[ "$E2E_HOST" =~ ^[a-z_][a-z0-9_-]*@[A-Za-z0-9.-]+$ ]] || { echo "--host: USER@HOST" >&2; exit 2; }
 
 # 1. Profile ---------------------------------------------------------------------------
@@ -74,6 +97,7 @@ fi
 # Profile contract (see SKILL.md): assignments and function definitions only at top level.
 UI_TARGET=local UI_DISPLAY=:99 SCREEN_W="" SCREEN_H="" LOG_HOST=local REAL_DEVICE=0
 PRODUCT_DESC="a graphical application" STATE_DIR="" LOG_FILES=() LINT_PATTERNS=() PROFILE_VARS=()
+PRODUCT_MAP="" SCOUT_HINTS=""
 # shellcheck source=../lib/stack.sh
 . "$SKILL/lib/stack.sh"
 # shellcheck source=/dev/null
@@ -83,10 +107,13 @@ for hook in profile_start profile_stop profile_status; do
 done
 
 # 2. Lint, lock --------------------------------------------------------------------------
-"$BIN/e2e-lint.sh" "$SCEN" "${LINT_PATTERNS[@]}"
+# A draft scenario may still fail the lint while exploring.
+# A scout's input is a task stub, not a scenario.
+[ "$MODE" = scout ] || "$BIN/e2e-lint.sh" "$SCEN" "${LINT_PATTERNS[@]}" || [ "$EXPLORE" = 1 ]
 TITLE=$(sed -nE 's/^# Scenario: (.+)/\1/p' "$SCEN" | head -1)
 STATE=${STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/blackbox-e2e}
 mkdir -p "$STATE"
+PRODUCT_MAP=${PRODUCT_MAP:-$STATE/maps/$PROFILE_NAME.md}
 exec 9> "$STATE/e2e-${PROFILE_NAME}-${UI_TARGET//[^A-Za-z0-9.]/_}.lock"
 flock -n 9 || { echo "E2E: BLOCKED (busy: another e2e-run holds the $PROFILE_NAME/$UI_TARGET lock)"; exit 3; }
 
@@ -111,10 +138,11 @@ export E2E_PRIV=$PRIV E2E_BIN=$BIN/e2e
 if declare -F profile_setup > /dev/null; then profile_setup; fi
 [[ "$SCREEN_W" =~ ^[0-9]+$ && "$SCREEN_H" =~ ^[0-9]+$ ]] || blocked "profile did not set SCREEN_W/SCREEN_H"
 SKILL_DIR=$SKILL SCENARIO=$PRIV/scenario.md SHOT_WIDTH=400
-MAX_CALLS=${E2E_MAX_CALLS:-120} MAX_SHOTS=${E2E_MAX_SHOTS:-24}
+if [ "$MODE" = scout ]; then MAX_CALLS=${E2E_MAX_CALLS:-200} MAX_SHOTS=${E2E_MAX_SHOTS:-40}
+else MAX_CALLS=${E2E_MAX_CALLS:-120} MAX_SHOTS=${E2E_MAX_SHOTS:-24}; fi
 {
     declare -p PROFILE PROFILE_NAME SKILL_DIR SANDBOX SCENARIO FIXTURES MAX_CALLS MAX_SHOTS SHOT_WIDTH \
-        UI_TARGET UI_DISPLAY SCREEN_W SCREEN_H LOG_HOST LOG_FILES E2E_HOST SOURCE
+        UI_TARGET UI_DISPLAY SCREEN_W SCREEN_H LOG_HOST LOG_FILES E2E_HOST SOURCE MODE
     for v in "${PROFILE_VARS[@]}" $(compgen -v E2E_SET_ || true); do declare -p "$v"; done
 } | sed 's/^declare -x /declare -- /' > "$PRIV/e2e.env"
 export PATH="$PRIV/bin:$PATH"
@@ -126,18 +154,37 @@ teardown() {
     if declare -F profile_teardown > /dev/null; then profile_teardown; else profile_stop > /dev/null 2>&1; fi
     [ "$DIRTY" = 1 ] && profile_db_restore && echo "fixtures reverted"
 }
-if [ -s "$FIXTURES" ]; then
+if grep -qE '^--[[:space:]]*@action[[:space:]]' "$FIXTURES"; then
+    declare -F profile_action > /dev/null || blocked "profile $PROFILE_NAME has no action support (profile_action)"
+fi
+if grep -qE '^--[[:space:]]*@fixture[[:space:]]' "$FIXTURES"; then
     for hook in profile_fixture profile_db_backup profile_db_restore; do
         declare -F "$hook" > /dev/null || blocked "profile $PROFILE_NAME has no fixture support ($hook)"
     done
     profile_db_backup || blocked "fixture backup failed"
     DIRTY=1
 fi
+# A scout may change the DB with `e2e sql`: back up when the profile can, else refuse such changes.
+if [ "$MODE" = scout ] && [ "$DIRTY" = 0 ]; then
+    if declare -F profile_db_backup > /dev/null && profile_db_backup > /dev/null 2>&1; then DIRTY=1
+    else : > "$PRIV/no-db-writes"; fi
+fi
 trap teardown EXIT
 trap 'exit 130' INT TERM
 if grep -qE '^--[[:space:]]*@fixture[[:space:]]+setup\b' "$FIXTURES"; then
-    awk '/^--[[:space:]]*@fixture[[:space:]]/{ on = ($3 == "setup"); next } on' "$FIXTURES" > "$PRIV/fixture.sql"
+    awk '/^--[[:space:]]*@(fixture|action)[[:space:]]/{ on = ($3 == "setup"); next } on' "$FIXTURES" > "$PRIV/fixture.sql"
     profile_fixture "$PRIV/fixture.sql" pre || blocked "setup fixture failed"
+fi
+
+if [ "$EXPLORE" = 1 ]; then
+    "$BIN/e2e" start || blocked "the stack did not start"
+    "$BIN/e2e" shot start || true
+    for f in "${EXPLORE_FIXTURES[@]}"; do
+        if "$BIN/e2e" fixture "$f"; then "$BIN/e2e" wait 3 > /dev/null; "$BIN/e2e" shot "after-$f" || true; fi
+    done
+    teardown; trap - EXIT
+    echo "explore: screenshots in $SANDBOX/shots (full size: $PRIV/raw-*.png), process output in $PRIV/*.out"
+    exit 0
 fi
 
 # 6. Tester -------------------------------------------------------------------------------
@@ -145,24 +192,34 @@ fi
 # {engine, model, cost_usd, turns, denied, stop, report|null}.
 DEVICE_RULE=""
 [ "$REAL_DEVICE" = 1 ] && DEVICE_RULE=" The device is real: a tap can have physical effects."
-if [ "$MODE" = white-box ]; then
+if [ -n "$SOURCE" ]; then
     SOURCE_RULE="You may read the source code under $SOURCE (read-only) to find controls, log messages and the expected behaviour. Judge PASS/FAIL only by what the application shows and logs, not by what the code says."
     VIEW_RULE="- The file viewer, grep and glob: on \`shots/NAME.png\` and on the source tree only. \`e2e git log|show|diff|blame|grep [ARGS]\` reads the source history."
 else
     SOURCE_RULE="You have no access to source code and must not try to get any. Judge only what the application shows and logs."
     VIEW_RULE="- The file viewer (Read/view) on \`shots/NAME.png\` only, right after \`e2e shot NAME\`."
 fi
+BRIEF=$SKILL/templates/brief.md SCHEMA=$SKILL/templates/report.schema.json
+[ "$MODE" = scout ] && BRIEF=$SCOUT/brief.md SCHEMA=$SCOUT/draft.schema.json
 {
     P=$PRODUCT_DESC D=$DEVICE_RULE C=$MAX_CALLS S=$MAX_SHOTS M=$MODE SR=$SOURCE_RULE VR=$VIEW_RULE perl -pe \
         's/\@PRODUCT\@/$ENV{P}/g; s/\@DEVICE_RULE\@/$ENV{D}/g; s/\@MAX_CALLS\@/$ENV{C}/g; s/\@MAX_SHOTS\@/$ENV{S}/g;
          s/\@MODE\@/$ENV{M}/g; s/\@SOURCE_RULE\@/$ENV{SR}/g; s/\@VIEW_RULE\@/$ENV{VR}/g' \
-        "$SKILL/templates/brief.md"
+        "$BRIEF"
     if [ "$ENGINE" = copilot ]; then
         printf '\nYour final message must be only the report as one JSON object (no prose, no code fence) matching this JSON Schema:\n'
-        cat "$SKILL/templates/report.schema.json"
+        cat "$SCHEMA"
+    fi
+    if [ "$MODE" = scout ]; then
+        [ -z "$SCOUT_HINTS" ] || printf '\n## Profile hints\n%s\n' "$SCOUT_HINTS"
+        printf '\n## Run options (the tester gets the same)\n'
+        for v in $(compgen -v E2E_SET_ || true); do printf -- '- %s=%s\n' "${v#E2E_SET_}" "${!v}"; done
+        [ -n "$(compgen -v E2E_SET_ || true)" ] || echo "(none)"
+        if [ -f "$PRODUCT_MAP" ]; then printf '\n## Product map (%s)\n' "$(basename "$PRODUCT_MAP")"; cat "$PRODUCT_MAP"
+        else printf '\n## Product map\n(none yet: everything you verify is a map addition)\n'; fi
     fi
     printf '\n\n---\n\nTarget: %s, screen %sx%s.\nDeclared fixtures: %s\n\n' "$PROFILE_NAME" "$SCREEN_W" "$SCREEN_H" \
-        "$(sed -nE 's/^--[[:space:]]*@fixture[[:space:]]+([A-Za-z0-9_-]+).*/\1/p' "$FIXTURES" | grep -vx setup | tr '\n' ' ' || true)"
+        "$(sed -nE 's/^--[[:space:]]*@(fixture|action)[[:space:]]+([A-Za-z0-9_-]+).*/\2/p' "$FIXTURES" | grep -vx setup | tr '\n' ' ' || true)"
     cat "$PRIV/scenario.md"
 } > "$PRIV/prompt.md"
 
@@ -179,7 +236,7 @@ EOF
         --restricted --strict-mcp-config --tools Read,Bash \
         --settings "$PRIV/settings.json" --permission-mode dontAsk --permission-prompts none \
         --model "$MODEL" --max-budget-usd "$BUDGET" --no-session-persistence \
-        --output-format json --json-schema "$(cat "$SKILL/templates/report.schema.json")" \
+        --output-format json --json-schema "$(cat "$SCHEMA")" \
         < /dev/null > "$RUN/result.json" 2> "$PRIV/tester.err")
     RC=$?
     jq -e . "$RUN/result.json" > /dev/null 2>&1 || echo '{}' > "$RUN/result.json"
@@ -219,8 +276,9 @@ run_copilot() {
     last=$(jq -rs '[.[] | select(.type == "assistant.message") | .data.content // empty] | last // ""' \
         "$RUN/result.jsonl" 2> /dev/null)
     # The report is the outermost {...} of the final message.
-    rep=$(perl -0ne 'print $1 if /(\{.*\})/s' <<< "$last" \
-        | jq -c 'select(.verdict and (.steps | type) == "array")' 2> /dev/null || true)
+    local check='select(.verdict and (.steps | type) == "array")'
+    [ "$MODE" = scout ] && check='select((.scenario_md | type) == "string" and (.fixtures_sql | type) == "string")'
+    rep=$(perl -0ne 'print $1 if /(\{.*\})/s' <<< "$last" | jq -c "$check" 2> /dev/null || true)
     jq -sc --arg model "$MODEL" --argjson rep "${rep:-null}" \
         --slurpfile usage <(cat "$PRIV/copilot-usage.json" 2> /dev/null || echo '{}') '
         {engine: "copilot", model: $model,
@@ -249,15 +307,40 @@ TURNS=$(jq -r '.turns' "$R")
 SUB=$(jq -r '.stop' "$R")
 REP=$(jq -c '.report // empty' "$R")
 EXTRA=$(jq -r 'if .engine == "copilot" then " (\(.ai_credits * 100 | round / 100) AI credits, \(.premium_requests) premium requests)" else "" end' "$R")
-if [ -n "$REP" ]; then VERDICT=$(jq -r '.verdict' <<< "$REP")
+if [ "$MODE" = scout ]; then
+    if [ -n "$REP" ]; then VERDICT=DRAFT; jq . <<< "$REP" > "$RUN/draft.json"; else VERDICT=BLOCKED; fi
+    {
+        echo "# Scout: $VERDICT, $TITLE"
+        echo
+        echo "Profile $PROFILE_NAME ($UI_TARGET) · scout · $ENGINE $MODEL · **total cost \$$(printf '%.4f' "$COST")**$EXTRA · $TURNS turns · $CALLS e2e calls · $SHOTS shots · wall ${WALL}s · denied tool calls $(jq -r '.denied' "$R")"
+        echo
+        if [ -n "$REP" ]; then echo "draft: $RUN/draft.json"; else echo "scout ended without a draft: $SUB (rc $RC)"; fi
+    } > "$RUN/report.md"
+    cat "$RUN/report.md"
+    jq -nc --arg date "$(date -Iseconds)" --arg title "$TITLE" --arg profile "$PROFILE_NAME" --arg target "$UI_TARGET" \
+        --arg verdict "$VERDICT" --arg engine "$ENGINE" --arg model "$MODEL" --argjson cost "$COST" --argjson turns "$TURNS" \
+        --argjson calls "$CALLS" --argjson shots "$SHOTS" --argjson wall "$WALL" --arg report "$RUN/report.md" \
+        '{date:$date, title:$title, profile:$profile, target:$target, mode:"scout", engine:$engine, model:$model, verdict:$verdict,
+          deviations:0, cost_usd:$cost, turns:$turns, calls:$calls, shots:$shots, wall_s:$wall, report:$report}' >> "$STATE/e2e-runs.jsonl"
+    [ "$VERDICT" = DRAFT ]; exit
+fi
+if [ -n "$REP" ]; then
+    # The verdict follows the steps (small models mislabel it): any FAIL/SKIPPED step or none at all -> FAIL.
+    VERDICT=$(jq -r 'if .verdict == "BLOCKED" then "BLOCKED"
+        elif (.steps | length) > 0 and all(.steps[]; .status == "PASS" or .status == "DEVIATION") then "PASS"
+        else "FAIL" end' <<< "$REP")
+    [ "$VERDICT" = "$(jq -r '.verdict' <<< "$REP")" ] \
+        || REP=$(jq -c --arg v "$VERDICT" '.notes = "Verdict \(.verdict) corrected to \($v) from the step statuses. " + .notes | .verdict = $v' <<< "$REP")
 else VERDICT=BLOCKED REP=$(jq -nc --arg n "tester ended without a report: $SUB (rc $RC)" '{verdict:"BLOCKED",steps:[],screenshots:[],log_lines:[],notes:$n}'); fi
 DENIED=$(jq -r '.denied' "$R")
+DEVIATIONS=$(jq '[.steps[]? | select(.status == "DEVIATION")] | length' <<< "$REP")
 
 {
     echo "# E2E: $VERDICT, $TITLE"
     echo
     echo "Profile $PROFILE_NAME ($UI_TARGET) · $MODE · $ENGINE $MODEL · **total cost \$$(printf '%.4f' "$COST")**$EXTRA · $TURNS turns · $CALLS e2e calls · $SHOTS shots · wall ${WALL}s · denied tool calls $DENIED"
     echo
+    [ "$DEVIATIONS" = 0 ] || { echo "**$DEVIATIONS step(s) with DEVIATION:** the criterion held, but the screen differed from the step. Relay them to the user, do not report a plain PASS."; echo; }
     echo "| Step | Status | Evidence |"; echo "|---|---|---|"
     jq -r '.steps[] | "| \(.n) | \(.status) | \(.evidence | gsub("\\|"; "/") | gsub("\n"; " ")) |"' <<< "$REP"
     echo
@@ -271,10 +354,10 @@ echo
 echo "report: $RUN/report.md"
 
 jq -nc --arg date "$(date -Iseconds)" --arg title "$TITLE" --arg profile "$PROFILE_NAME" --arg target "$UI_TARGET" \
-    --arg verdict "$VERDICT" --arg engine "$ENGINE" --arg model "$MODEL" --arg mode "$MODE" \
+    --arg verdict "$VERDICT" --argjson deviations "$DEVIATIONS" --arg engine "$ENGINE" --arg model "$MODEL" --arg mode "$MODE" \
     --argjson cost "$COST" --argjson turns "$TURNS" --argjson calls "$CALLS" --argjson shots "$SHOTS" \
     --argjson wall "$WALL" --arg report "$RUN/report.md" \
-    '{date:$date, title:$title, profile:$profile, target:$target, mode:$mode, engine:$engine, model:$model, verdict:$verdict,
+    '{date:$date, title:$title, profile:$profile, target:$target, mode:$mode, engine:$engine, model:$model, verdict:$verdict, deviations:$deviations,
       cost_usd:$cost, turns:$turns, calls:$calls, shots:$shots, wall_s:$wall, report:$report}' >> "$STATE/e2e-runs.jsonl"
 echo "cumulative E2E cost ($STATE/e2e-runs.jsonl): \$$(jq -s 'map(.cost_usd) | add | . * 10000 | round / 10000' "$STATE/e2e-runs.jsonl") over $(wc -l < "$STATE/e2e-runs.jsonl") runs"
 

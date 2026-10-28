@@ -12,7 +12,7 @@
         "required": ["n", "status", "evidence"],
         "properties": {
           "n": { "type": "integer" },
-          "status": { "enum": ["PASS", "FAIL", "SKIPPED"] },
+          "status": { "enum": ["PASS", "DEVIATION", "FAIL", "SKIPPED"] },
           "evidence": { "type": "string", "maxLength": 400 }
         }
       }

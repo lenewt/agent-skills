@@ -9,8 +9,13 @@
 #   e2e wait SECONDS              (<= 180)
 #   e2e log PATTERN-NAME [N]      declared regex over this run's logs, last N (<= 100) lines
 #   e2e patterns | fixtures       list the declared names
-#   e2e fixture NAME              apply a declared fixture (profile_fixture FILE live)
+#   e2e fixture NAME              apply a declared fixture (profile_fixture FILE live) or action
+#                                 (profile_action NAME FILE): the tester sees one list of names
 #   e2e git log|show|diff|blame|grep [ARGS]   white-box runs only: read the source history
+#   e2e grep REGEX [N]            scout runs only: ad-hoc regex over this run's logs
+#   e2e sql 'STATEMENT'           scout runs only: one SQL statement on the config DB (SELECT, or
+#                                 a change applied live like a fixture; restored at teardown)
+#   e2e try-action 'LINE'         scout runs only: one profile action line (e.g. a sensor value)
 # A && B || die: B is always a test, so die runs exactly when a check fails.
 # shellcheck disable=SC2015
 # shellcheck source-path=SCRIPTDIR
@@ -48,7 +53,10 @@ section() {  # section "Heading" -> lines of that ## section
 pattern_of() {  # pattern_of NAME: "- name: regex" lines under "## Log patterns"
     section "Log patterns" | P="$1" perl -ne 'if (/^\s*[-*]\s*`?([A-Za-z0-9_-]+)`?\s*:\s*(.+?)\s*$/ && $1 eq $ENV{P}) { $r = $2; $r =~ s/^`(.*)`$/$1/; print "$r\n"; exit }'
 }
-fixture_names() { [ -f "$FIXTURES" ] && sed -nE 's/^--[[:space:]]*@fixture[[:space:]]+([A-Za-z0-9_-]+).*/\1/p' "$FIXTURES"; }
+fixture_names() { [ -f "$FIXTURES" ] && sed -nE 's/^--[[:space:]]*@(fixture|action)[[:space:]]+([A-Za-z0-9_-]+).*/\2/p' "$FIXTURES"; }
+block_kind() {  # block_kind NAME -> fixture | action
+    sed -nE "s/^--[[:space:]]*@(fixture|action)[[:space:]]+$1([[:space:]].*)?\$/\1/p" "$FIXTURES" | head -1
+}
 in_safety_rect() {  # in_safety_rect X Y -> 0 when inside a "rect: x1 y1 x2 y2" of ## Safety
     section "Safety" | X="$1" Y="$2" perl -ne 'BEGIN { ($x, $y) = @ENV{qw(X Y)} }
         if (/rect:\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/ && $x >= $1 && $x <= $3 && $y >= $2 && $y <= $4) { $hit = 1 }
@@ -96,9 +104,15 @@ case "$verb" in
     patterns) # shellcheck disable=SC2016
         section "Log patterns" | sed -nE 's/^\s*[-*]\s*`?([A-Za-z0-9_-]+)`?\s*:.*/\1/p' ;;
     fixtures) fixture_names | grep -vx setup ;;
-    log)
-        [ $# -ge 1 ] && [ $# -le 2 ] && [[ "$1" =~ ^[A-Za-z0-9_-]+$ ]] || die "usage: log PATTERN-NAME [N]"
-        re=$(pattern_of "$1"); [ -n "$re" ] || die "undeclared pattern '$1' (see: e2e patterns)"
+    log|grep)
+        if [ "$verb" = grep ]; then
+            [ "${MODE:-}" = scout ] || die "grep is only available in scout runs; use log PATTERN-NAME"
+            [ $# -ge 1 ] && [ $# -le 2 ] && [[ "$1" =~ ^[[:print:]]{1,200}$ ]] || die "usage: grep 'REGEX' [N]"
+            re=$1
+        else
+            [ $# -ge 1 ] && [ $# -le 2 ] && [[ "$1" =~ ^[A-Za-z0-9_-]+$ ]] || die "usage: log PATTERN-NAME [N]"
+            re=$(pattern_of "$1"); [ -n "$re" ] || die "undeclared pattern '$1' (see: e2e patterns)"
+        fi
         n=${2:-20}; is_int "$n" && [ "$n" -le 100 ] || die "N must be <= 100"
         [ -s "$E2E_PRIV/log-offsets" ] || die "stack not started by this run, or the profile has no logs"
         while read -r f off; do
@@ -111,10 +125,40 @@ case "$verb" in
     fixture)
         [ $# -eq 1 ] && [[ "$1" =~ ^[A-Za-z0-9_-]+$ ]] && [ "$1" != setup ] || die "usage: fixture NAME"
         fixture_names | grep -qx "$1" || die "undeclared fixture '$1' (see: e2e fixtures)"
-        declare -F profile_fixture > /dev/null || die "this target has no fixture support"
-        awk -v n="$1" '/^--[[:space:]]*@fixture[[:space:]]/{ on = ($3 == n); next } on' "$FIXTURES" > "$E2E_PRIV/fixture.sql"
-        profile_fixture "$E2E_PRIV/fixture.sql" live || die "fixture '$1' failed"
+        awk -v n="$1" '/^--[[:space:]]*@(fixture|action)[[:space:]]/{ on = ($3 == n); next } on' "$FIXTURES" > "$E2E_PRIV/fixture.sql"
+        if [ "$(block_kind "$1")" = action ]; then
+            declare -F profile_action > /dev/null || die "this target has no action support"
+            profile_action "$1" "$E2E_PRIV/fixture.sql" || die "fixture '$1' failed"
+        else
+            declare -F profile_fixture > /dev/null || die "this target has no fixture support"
+            profile_fixture "$E2E_PRIV/fixture.sql" live || die "fixture '$1' failed"
+        fi
         echo "fixture $1 applied"
+        ;;
+    sql)
+        [ "${MODE:-}" = scout ] || die "sql is only available in scout runs"
+        [ $# -eq 1 ] && [[ "$1" =~ ^[[:print:]]{1,2000}$ ]] || die "usage: sql 'ONE STATEMENT' (<= 2000 chars)"
+        declare -F profile_fixture > /dev/null || die "this target has no fixture support"
+        printf '.mode list\n.headers on\n%s;\n' "${1%;}" > "$E2E_PRIV/fixture.sql"
+        if [[ "$1" =~ ^[[:space:]]*([Ss][Ee][Ll][Ee][Cc][Tt]|[Pp][Rr][Aa][Gg][Mm][Aa])[[:space:]] ]]; then
+            declare -F profile_query > /dev/null || die "this target cannot run read-only queries"
+            profile_query "$E2E_PRIV/fixture.sql" 2>&1 | cut -c1-400 | head -n 100
+        else
+            [ ! -e "$E2E_PRIV/no-db-writes" ] || die "no DB backup for this run: only SELECT/PRAGMA are allowed"
+            profile_fixture "$E2E_PRIV/fixture.sql" live 2>&1 | cut -c1-400 | head -n 100
+            [ "${PIPESTATUS[0]}" = 0 ] || die "statement failed"
+            printf 'sql %s\n' "${1%;}" >> "$E2E_PRIV/stimuli.log"
+            echo "applied (live)"
+        fi
+        ;;
+    try-action)
+        [ "${MODE:-}" = scout ] || die "try-action is only available in scout runs"
+        [ $# -eq 1 ] && [[ "$1" =~ ^[[:print:]]{1,200}$ ]] || die "usage: try-action 'LINE'"
+        declare -F profile_action > /dev/null || die "this target has no action support"
+        printf '%s\n' "$1" > "$E2E_PRIV/fixture.sql"
+        profile_action try "$E2E_PRIV/fixture.sql" || die "action failed"
+        printf 'action %s\n' "$1" >> "$E2E_PRIV/stimuli.log"
+        echo "action applied"
         ;;
     git)
         [ -n "${SOURCE:-}" ] || die "git is only available in white-box runs"
@@ -133,5 +177,5 @@ case "$verb" in
         cat "$E2E_PRIV/git.out"
         [ "$(wc -l < "$E2E_PRIV/git.out")" -lt 400 ] || echo "(output truncated at 400 lines; narrow the query)"
         ;;
-    *) die "unknown verb '$verb'. Verbs: start stop status shot tap swipe key type wait log patterns fixtures fixture git" ;;
+    *) die "unknown verb '$verb'. Verbs: start stop status shot tap swipe key type wait log patterns fixtures fixture git (scout: grep sql try-action)" ;;
 esac

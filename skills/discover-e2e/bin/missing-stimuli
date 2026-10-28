@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+"""missing-stimuli STIMULI_LOG FIXTURES_SQL: print the stimuli a scout applied (`sql …` / `action …`
+lines of its stimuli.log) that the draft fixtures do not contain. Such a draft worked for the scout
+and fails for the tester, which starts from the run options and the fixtures only."""
+import re
+import sys
+
+
+def normalized(text):
+    return re.sub(r"\s+", " ", text.replace('"', "'")).strip().rstrip(";").strip().lower()
+
+
+def lines_of(path, pattern):
+    try:
+        return re.split(pattern, open(path).read())
+    except OSError:
+        return []
+
+
+applied = [line.split(" ", 1) for line in lines_of(sys.argv[1], r"\n") if " " in line]
+fixtures = {normalized(statement) for statement in lines_of(sys.argv[2], r";\s*\n|\n")}
+for kind, text in applied:
+    if normalized(text) not in fixtures:
+        print(kind, text)

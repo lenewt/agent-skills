@@ -1,0 +1,37 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["scenario_md", "fixtures_sql", "evidence", "map_additions", "open_questions", "notes"],
+  "properties": {
+    "scenario_md": { "type": "string", "maxLength": 12000 },
+    "fixtures_sql": { "type": "string", "maxLength": 8000 },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["step", "observed"],
+        "properties": {
+          "step": { "type": "integer" },
+          "observed": { "type": "string", "maxLength": 400 },
+          "screenshot": { "type": "string" }
+        }
+      }
+    },
+    "map_additions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["section", "fact", "evidence"],
+        "properties": {
+          "section": { "enum": ["Safety", "Screens", "Flows", "Fixtures and actions", "Logs", "Pitfalls"] },
+          "fact": { "type": "string", "maxLength": 400 },
+          "evidence": { "type": "string", "maxLength": 300 }
+        }
+      }
+    },
+    "open_questions": { "type": "array", "items": { "type": "string", "maxLength": 400 } },
+    "notes": { "type": "string", "maxLength": 800 }
+  }
+}

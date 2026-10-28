@@ -26,5 +26,9 @@ grep -qE '^## Steps[[:space:]]*$' "$f" || hit "missing '## Steps'"
 awk '/^## /{ on = ($0 ~ /^## Steps/); next } on && /^[0-9]+\./' "$f" | grep -qv 'PASS if' \
     && hit "every step needs a 'PASS if <observable>' criterion"
 [ "$(wc -c < "$f")" -le 12000 ] || hit "scenario longer than 12000 bytes; split it"
+# Self-graded oracle: a fixture or action that checks the product and logs "PASS …" turns the tester into a relay.
+# Log patterns must match what the product writes; protocol assertions belong in unit tests.
+while IFS= read -r m; do hit "log pattern matches a test verdict word (PASS/FAIL), not product output: $m"; done < <(
+    awk '/^## /{ on = ($0 ~ /^## Log patterns/); next } on' "$f" | grep -E '\b(PASS|FAIL|FAILED)\b')
 
 if [ "$hits" -eq 0 ]; then echo "lint: ok"; else exit 1; fi

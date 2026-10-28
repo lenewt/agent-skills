@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+# discover-e2e: draft a black-box E2E scenario for a change with a cheap, separate scout
+# (Copilot CLI, read-only source, `e2e` verbs only), so the author's session does not pay for
+# the exploration. See ../SKILL.md.
+#
+#   discover-e2e --profile NAME|FILE [--change RANGE] [--goal TEXT] [--ticket FILE] [--source DIR]
+#                [--host USER@HOST] [--set KEY=VALUE]... [--model M] [--budget USD] [--out DIR]
+#                [--verify]
+#   discover-e2e --accept-map DRAFT_DIR [--only N[,N...]]
+#
+# --change   commits under test (default: @{upstream}..HEAD, else HEAD~1..HEAD); uncommitted
+#            changes in --source are listed too
+# --goal     one line: what the scenario must show (default: the first commit subject)
+# --ticket   a text file with the ticket (e.g. an issue-tracker export), first 6000 bytes
+# --verify   after the draft, run it once through the black-box tester (blackbox-e2e)
+# --accept-map  append the draft's verified map additions (all, or the numbered ones) to the
+#            profile's product map (PRODUCT_MAP, default <state>/maps/<profile>.md)
+# Prints a short summary; the draft dir holds scenario.md, fixtures.sql, discovery.md,
+# map-additions.md, open-questions.md, draft.json and the scout's run (scout/).
+set -euo pipefail
+
+SKILL="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+BB=${BLACKBOX_E2E:-$SKILL/../blackbox-e2e}
+[ -x "$BB/bin/e2e-run.sh" ] || BB=$HOME/.claude/skills/blackbox-e2e
+[ -x "$BB/bin/e2e-run.sh" ] || { echo "blackbox-e2e not found (set BLACKBOX_E2E)" >&2; exit 2; }
+BB=$(cd "$BB" && pwd)
+
+usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+PROFILE="" CHANGE="" GOAL="" TICKET="" SOURCE="" OUT="" VERIFY=0 ACCEPT="" ONLY=""
+PASS=()        # options for both the scout and the verification run
+SCOUT_OPTS=()  # scout only
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --profile)    PROFILE=$2; shift 2 ;;
+        --change)     CHANGE=$2; shift 2 ;;
+        --goal)       GOAL=$2; shift 2 ;;
+        --ticket)     TICKET=$2; shift 2 ;;
+        --source)     SOURCE=$(cd "$2" && pwd) || exit 2; shift 2 ;;
+        --host|--set) PASS+=("$1" "$2"); shift 2 ;;
+        --model|--budget) SCOUT_OPTS+=("$1" "$2"); shift 2 ;;
+        --out)        OUT=$2; shift 2 ;;
+        --verify)     VERIFY=1; shift ;;
+        --accept-map) ACCEPT=$(cd "$2" && pwd) || exit 2; shift 2 ;;
+        --only)       ONLY=$2; shift 2 ;;
+        *) usage ;;
+    esac
+done
+
+# --- profile lookup (same rules as e2e-run.sh) ------------------------------------------
+find_profile() {
+    local d
+    if [ -f "$1" ]; then (cd "$(dirname "$1")" && echo "$PWD/$(basename "$1")"); return; fi
+    IFS=: read -r -a dirs <<< "${E2E_PROFILE_PATH:-}"
+    for d in "${dirs[@]}" "$BB/profiles"; do
+        [ -n "$d" ] && [ -f "$d/$1.sh" ] && { (cd "$d" && echo "$PWD/$1.sh"); return; }
+    done
+    return 1
+}
+# profile_info FILE: prints the map path, then one LINT_PATTERNS entry per line.
+profile_info() {
+    (
+        name=$(basename "$1" .sh) STATE_DIR="" PRODUCT_MAP="" LINT_PATTERNS=()
+        # shellcheck source=/dev/null
+        . "$BB/lib/stack.sh"
+        # shellcheck source=/dev/null
+        . "$1" > /dev/null 2>&1
+        state=${STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/blackbox-e2e}
+        echo "${PRODUCT_MAP:-$state/maps/$name.md}"
+        printf '%s\n' "${LINT_PATTERNS[@]}"
+    )
+}
+
+# --- accept map additions -----------------------------------------------------------------
+if [ -n "$ACCEPT" ]; then
+    if [ ! -f "$ACCEPT/draft.json" ] || [ ! -f "$ACCEPT/meta" ]; then echo "$ACCEPT is not a discover-e2e draft" >&2; exit 2; fi
+    MAP=$(sed -n 's/^map=//p' "$ACCEPT/meta")
+    mkdir -p "$(dirname "$MAP")"
+    [ -f "$MAP" ] || sed "s/<profile name>/$(sed -n 's/^profile=//p' "$ACCEPT/meta")/" "$SKILL/templates/map.example.md" > "$MAP"
+    python3 - "$MAP" "$ACCEPT/draft.json" "$ONLY" "$(sed -n 's/^title=//p' "$ACCEPT/meta")" <<'EOF'
+import json, re, sys
+path, draft, only, title = sys.argv[1:5]
+adds = json.load(open(draft)).get("map_additions", [])
+keep = {int(n) for n in only.split(",") if n.strip()} if only else set(range(1, len(adds) + 1))
+lines = open(path).read().rstrip("\n").split("\n")
+added = 0
+for n, a in enumerate(adds, 1):
+    if n not in keep:
+        continue
+    head = "## " + a["section"]
+    entry = "- %s (verified: %s; %s)" % (a["fact"].strip(), a["evidence"].strip(), title)
+    if head not in lines:
+        lines += ["", head]
+    i = lines.index(head) + 1
+    while i < len(lines) and not lines[i].startswith("## "):
+        i += 1
+    while i > 0 and lines[i - 1] == "":
+        i -= 1
+    lines.insert(i, entry)
+    added += 1
+open(path, "w").write("\n".join(lines) + "\n")
+print("map: %d addition(s) appended to %s" % (added, path))
+EOF
+    exit 0
+fi
+
+# --- inputs --------------------------------------------------------------------------------
+[ -n "$PROFILE" ] || usage
+PFILE=$(find_profile "$PROFILE") || { echo "profile '$PROFILE' not found (E2E_PROFILE_PATH, $BB/profiles)" >&2; exit 2; }
+PNAME=$(basename "$PFILE" .sh)
+mapfile -t INFO < <(profile_info "$PFILE")
+MAP=${INFO[0]}; LINT=("${INFO[@]:1}")
+SOURCE=${SOURCE:-$(git rev-parse --show-toplevel 2> /dev/null)} || true
+[ -n "$SOURCE" ] || { echo "--source: not in a git checkout" >&2; exit 2; }
+if [ -z "$CHANGE" ]; then
+    if git -C "$SOURCE" rev-parse -q --verify '@{upstream}' > /dev/null 2>&1; then CHANGE='@{upstream}..HEAD'; else CHANGE='HEAD~1..HEAD'; fi
+fi
+git -C "$SOURCE" rev-list -n 1 "${CHANGE##*..}" > /dev/null 2>&1 || { echo "--change: bad range $CHANGE" >&2; exit 2; }
+[ -z "$TICKET" ] || [ -f "$TICKET" ] || { echo "--ticket: no such file" >&2; exit 2; }
+GOAL=${GOAL:-$(git -C "$SOURCE" log --format=%s -n 1 "${CHANGE##*..}")}
+if [ -n "$OUT" ]; then mkdir -p "$OUT"; OUT=$(cd "$OUT" && pwd)
+else OUT=$(mktemp -d "${CLAUDE_SCRATCHPAD:-${TMPDIR:-/tmp}}/discover-$(date +%Y%m%d-%H%M%S)-XXXX"); fi
+
+safety() {  # the map's Safety section, without the template's placeholder line
+    [ -f "$MAP" ] && awk '/^## /{ on = ($0 == "## Safety"); next } on' "$MAP" | grep -v '^Free text copied' | sed '/./,$!d'
+}
+{
+    echo "# Scenario: discover: $GOAL"
+    echo "Target: $PNAME"
+    echo
+    echo "## Task"
+    echo "Goal: $GOAL"
+    echo "Change under test: \`$CHANGE\` in the source tree $SOURCE (read it with \`e2e git show\` / \`e2e git diff\`)."
+    echo
+    git -C "$SOURCE" log --oneline -n 20 "$CHANGE" | sed 's/^/    /'
+    echo
+    git -C "$SOURCE" diff --stat=120 "$CHANGE" | tail -n 60 | sed 's/^/    /'
+    # Moved submodules: their own commits and files (read them with the file viewer).
+    git -C "$SOURCE" diff --raw --no-abbrev "$CHANGE" | awk '$1 == ":160000" && $2 == "160000" { print $3, $4, $6 }' \
+        | while read -r old new path; do
+            echo
+            echo "Submodule $path ($old..$new):"
+            { git -C "$SOURCE/$path" log --oneline -n 20 "$old..$new" && git -C "$SOURCE/$path" diff --stat=120 "$old" "$new" | tail -n 40; } \
+                2> /dev/null | sed 's/^/    /' || echo "    (not checked out)"
+        done
+    st=$(git -C "$SOURCE" status --short --untracked-files=no | head -n 30)
+    [ -z "$st" ] || { echo; echo "Uncommitted changes (also under test):"; printf '%s\n' "$st" | sed 's/^/    /'; }
+    [ -z "$TICKET" ] || { echo; echo "Ticket:"; head -c 6000 "$TICKET" | sed 's/^/    /'; echo; }
+    echo
+    echo "## Safety"
+    s=$(safety || true)
+    if [ -n "$s" ]; then echo "$s"; else echo "No restriction declared."; fi
+} > "$OUT/task.md"
+printf 'profile=%s\nmap=%s\ntitle=%s\n' "$PNAME" "$MAP" "$GOAL" > "$OUT/meta"
+
+# --- scout -----------------------------------------------------------------------------------
+set +e
+"$BB/bin/e2e-run.sh" "$OUT/task.md" --profile "$PFILE" --scout "$SKILL/templates" --source "$SOURCE" \
+    --out "$OUT/scout" "${PASS[@]}" "${SCOUT_OPTS[@]}" > "$OUT/scout.log" 2>&1
+RC=$?
+set -e
+SCOUT_LINE=$(grep -m1 -E '^Profile .* scout ' "$OUT/scout.log" || true)
+if [ "$RC" != 0 ] || [ ! -f "$OUT/scout/draft.json" ]; then
+    tail -n 20 "$OUT/scout.log"
+    echo "discover-e2e: no draft (rc $RC); log $OUT/scout.log"
+    exit 1
+fi
+
+# --- draft files -------------------------------------------------------------------------------
+D=$OUT/scout/draft.json
+cp "$D" "$OUT/draft.json"
+jq -r '.scenario_md' "$D" > "$OUT/scenario.md"
+grep -qE '^Target: ' "$OUT/scenario.md" || sed -i "1a Target: $PNAME" "$OUT/scenario.md"
+FIX=()
+if [ -n "$(jq -r '.fixtures_sql | gsub("\\s"; "")' "$D")" ]; then
+    jq -r '.fixtures_sql' "$D" > "$OUT/fixtures.sql"; FIX=(--fixtures "$OUT/fixtures.sql")
+fi
+jq -r --arg shots "$OUT/scout/sandbox" '"# Discovery evidence\n",
+    (.evidence[] | "- step \(.step): \(.observed)" + (if .screenshot then " (\($shots)/\(.screenshot))" else "" end)),
+    "\nNotes: \(.notes)"' "$D" > "$OUT/discovery.md"
+jq -r '"# Proposed map additions (accept: discover-e2e --accept-map DIR [--only N,...])\n",
+    (.map_additions | to_entries[] | "\(.key + 1). [\(.value.section)] \(.value.fact) (evidence: \(.value.evidence))")' \
+    "$D" > "$OUT/map-additions.md"
+jq -r '"# Open questions\n", (.open_questions[] | "- \(.)")' "$D" > "$OUT/open-questions.md"
+
+MISSING=$("$SKILL/bin/missing-stimuli" "$OUT/scout/priv/stimuli.log" "$OUT/fixtures.sql")
+{
+    echo
+    echo "## Stimuli applied by the scout (in order)"
+    if [ -s "$OUT/scout/priv/stimuli.log" ]; then sed 's/^/- /' "$OUT/scout/priv/stimuli.log"; else echo "(none)"; fi
+    [ -z "$MISSING" ] || { echo; echo "## Not in the draft fixtures"; printf '%s\n' "$MISSING" | sed 's/^/- /'; }
+} >> "$OUT/discovery.md"
+
+LINT_OUT=$("$BB/bin/e2e-lint.sh" "$OUT/scenario.md" "${LINT[@]}" 2>&1) && LINT_OK=1 || LINT_OK=0
+
+echo "discover-e2e: draft in $OUT"
+echo "  scout: ${SCOUT_LINE:-?}"
+echo "  scenario.md: $(grep -cE '^[0-9]+\.' "$OUT/scenario.md") steps; fixtures: $([ ${#FIX[@]} -gt 0 ] && grep -cE '^--[[:space:]]*@(fixture|action)' "$OUT/fixtures.sql" || echo 0) blocks"
+if [ "$LINT_OK" = 1 ]; then echo "  lint: ok"; else echo "  lint: FAILED"; printf '%s\n' "$LINT_OUT" | sed 's/^/    /'; fi
+echo "  map additions: $(jq '.map_additions | length' "$D") (map: $MAP)"
+echo "  open questions: $(jq '.open_questions | length' "$D")"
+if [ -n "$MISSING" ]; then
+    echo "  check: stimuli the scout applied that the fixtures lack verbatim (fine if merged into another statement):"
+    printf '%s\n' "$MISSING" | sed 's/^/    /'
+fi
+
+# --- verification run ---------------------------------------------------------------------------
+if [ "$VERIFY" = 1 ]; then
+    [ "$LINT_OK" = 1 ] || { echo "  verify: skipped (lint failed)"; exit 1; }
+    set +e
+    "$BB/bin/e2e-run.sh" "$OUT/scenario.md" --profile "$PFILE" "${FIX[@]}" "${PASS[@]}" --out "$OUT/verify" > "$OUT/verify.log" 2>&1
+    RC=$?
+    set -e
+    echo "  verify: $(head -n 1 "$OUT/verify/report.md" 2> /dev/null | sed 's/^# //' || echo "no report (rc $RC)"); $(grep -m1 -oE 'total cost \$[0-9.]+' "$OUT/verify/report.md" 2> /dev/null || true); report $OUT/verify/report.md"
+    exit "$RC"
+fi
+[ "$LINT_OK" = 1 ]

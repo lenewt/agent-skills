@@ -32,13 +32,27 @@ LINT_PATTERNS=(…)   STATE_DIR=…   PROFILE_VARS=(…)   # product names to re
 profile_setup        # runner: check the build, compute PROFILE_VARS; blocked "…" when it cannot run
 profile_start / profile_stop / profile_status
 profile_fixture FILE pre|live ; profile_db_backup ; profile_db_restore    # optional: SQL fixtures
+profile_action NAME FILE   # optional: run an @action block (its body is the profile's own mini-language)
 profile_teardown     # optional (default: profile_stop, then the DB restore when fixtures ran)
 ```
 
 Copy `profiles/x11-command.sh` as a starting point. `--set key=value` reaches the profile as `$E2E_SET_key`, and
 `--host` as `$E2E_HOST`.
 
-## 2. Write the scenario (behaviour only)
+## 2. Look first, then write the scenario (behaviour only)
+
+Prefer the **`discover-e2e`** skill: a cheap scout explores and drafts the scenario and its fixtures, so your own
+session does not pay for screenshots and log greps. The manual way below remains for small edits.
+
+Never write steps from memory, the DB or translation files: labels, screens and auto-advancing flows are only known
+after you see them. Explore first, which costs nothing (no tester):
+
+```bash
+~/.claude/skills/blackbox-e2e/bin/e2e-run.sh draft.md --fixtures f.sql --explore [--explore-fixture NAME]...
+```
+
+It starts the stack with the `setup` fixture, saves `shots/start.png`, then applies each `--explore-fixture` in
+order and saves `shots/after-NAME.png`. Read the screenshots, then write the steps against them.
 
 ```
 # Scenario: <title>
@@ -58,6 +72,12 @@ Target: <profile name>
 - 3 to 15 steps, each with one observable criterion; at most 12000 bytes. Example: `templates/scenario.example.md`.
 - Fixtures: a separate SQL file with `-- @fixture <name>` blocks. `setup` is applied before start; the others are
   offered to the tester by name only. The DB is backed up first and restored at teardown.
+- Actions: `-- @action <name>` blocks in the same file, for stimuli that are not SQL (a simulated sensor value, a
+  restart, one request). The body is passed to the profile's `profile_action`, whose verbs the profile documents. The
+  tester applies them with the same `e2e fixture NAME`. Never fake an action with a SQL sentinel.
+- **Stimulate, never judge.** Fixtures and actions change the input. They must not check the product and log a
+  verdict that the tester only relays: that is a self-graded test. `e2e-lint.sh` refuses log patterns that match
+  PASS/FAIL. Assert the protocol in unit tests; in E2E, judge what the screen and the product's own logs show.
 
 ## 3. Run
 
@@ -92,6 +112,14 @@ Limits (env overrides): `E2E_BUDGET` USD 4, `E2E_MAX_CALLS` 120, `E2E_MAX_SHOTS`
 `--source DIR` switches to **white-box** mode (Copilot only): the tester may also read DIR. Use the
 `whitebox-e2e` skill for it (`~/.claude/skills/whitebox-e2e/SKILL.md`); without `--source` nothing changes.
 
+`--scout DIR` (with `--engine copilot --source`) runs a **scout** that drafts a scenario instead of judging one. Do not
+call it directly: the `discover-e2e` skill wraps it. The scout gets three extra verbs, refused in other modes:
+`grep 'REGEX' [N]` (run logs), `sql 'ONE STATEMENT'` (SELECT/PRAGMA through `profile_query`; writes through
+`profile_fixture FILE live`, refused when the DB backup failed) and `try-action 'LINE'` (`profile_action`). Applied
+writes and actions are recorded in `priv/stimuli.log`. Optional profile hooks: `PRODUCT_MAP` (default
+`$STATE_DIR/maps/<profile>.md`), `SCOUT_HINTS`, `profile_query`. Scout limits: `E2E_SCOUT_BUDGET` USD 0.5, 200
+calls, 40 shots.
+
 ## 4. Report
 
 The runner prints `report.md`: verdict, step table, ≤ 2 screenshot paths, key log lines, and the **total cost**,
@@ -100,6 +128,9 @@ turns, `e2e` calls, screenshots, wall time and denied tool calls. It appends one
 
 On FAIL, look at the screenshot and log lines yourself before blaming the product: a vague step or a wrong regex
 is fixed in the scenario. Denied tool calls mean the tester tried to leave its box; mention them.
+
+A step is `DEVIATION` when its criterion held but the screen differed from the step text. The verdict can still be
+PASS. Report each deviation to the user next to the verdict: it is either a scenario to fix or a behaviour to confirm.
 
 ## Files
 
