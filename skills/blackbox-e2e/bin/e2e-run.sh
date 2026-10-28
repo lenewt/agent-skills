@@ -22,13 +22,19 @@
 # The profile defaults to the scenario's "Target: <name>", looked up in $E2E_PROFILE_PATH
 # (colon-separated dirs), then in this skill's profiles/. Prints the per-step verdict, the
 # total cost and wall time, writes <run>/report.md and appends to $STATE_DIR/e2e-runs.jsonl.
+# The engine defaults to $E2E_ENGINE, then to the calling session's tool (copilot inside a Copilot session).
 # shellcheck source-path=SCRIPTDIR
 set -euo pipefail
 
 BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL="$(dirname "$BIN")"
 
-usage() { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { awk 'NR > 1 && !/^#/ { exit } NR > 1 && !/shellcheck/ { sub(/^# ?/, ""); print }' "$0"; exit 2; }
+# session_engine: the caller's own tool, so the run bills the subscription the session already uses.
+session_engine() {
+    if [ -z "${CLAUDECODE:-}" ] && [ -n "${COPILOT_CLI:-}${COPILOT_AGENT_SESSION_ID:-}" ]; then echo copilot
+    else echo claude; fi
+}
 SCEN=${1:-}; [ -f "$SCEN" ] || usage; shift
 PROFILE_ARG="" FIXTURES_IN="" OUT="" SOURCE="" EXPLORE=0 EXPLORE_FIXTURES=() SCOUT="" BUDGET="" ENGINE=${E2E_ENGINE:-} MODEL=${E2E_MODEL:-}
 export E2E_HOST=${E2E_HOST:-}
@@ -61,7 +67,7 @@ if [ -n "$SCOUT" ]; then
     fi
     BUDGET=${BUDGET:-${E2E_SCOUT_BUDGET:-0.5}}
 fi
-ENGINE=${ENGINE:-claude} BUDGET=${BUDGET:-${E2E_BUDGET:-4}}
+ENGINE=${ENGINE:-$(session_engine)} BUDGET=${BUDGET:-${E2E_BUDGET:-4}}
 case "$ENGINE" in
     claude)  MODEL=${MODEL:-haiku} ;;
     copilot) MODEL=${MODEL:-gpt-6-luna} ;;

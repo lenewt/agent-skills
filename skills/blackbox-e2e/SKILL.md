@@ -97,7 +97,10 @@ Run it in the foreground (a run usually takes 20–90 s). Do not watch the teste
 or BLOCKED, 2 = usage, 3 = BLOCKED before the tester started (busy lock, no build, unreachable device).
 Run dirs go to `$CLAUDE_SCRATCHPAD` or `$TMPDIR`, and must not be inside a git repository (the runner refuses).
 
-| | `claude` (default) | `copilot` |
+The engine is `--engine`, else `$E2E_ENGINE`, else the calling session's tool: `copilot` inside a Copilot session
+(`COPILOT_CLI` or `COPILOT_AGENT_SESSION_ID` set, `CLAUDECODE` unset), `claude` otherwise.
+
+| | `claude` | `copilot` |
 |---|---|---|
 | CLI and model | `claude -p --restricted`, `haiku` | Copilot CLI `copilot -p`, `gpt-6-luna` |
 | Billed to | the Claude Code login | Copilot AI credits (1 credit = $0.01) + 1 premium request |
