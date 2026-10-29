@@ -20,6 +20,7 @@ Serial: logs in as USER (password from $DEVSH_PASSWORD if prompted), disables ec
 (nmcli/systemctl otherwise wedge the console) and brackets each command with markers, so console
 noise from services writing to the tty is tolerated. --noise drops matching output lines (e.g. a log
 timestamp prefix '^\\d\\d/\\d\\d/\\d{4} ').
+$DEVSH_PACE=BYTES/MS sets the serial write pacing (default 16/4: 16 bytes, then 4 ms); e.g. 64/1 is faster on a quiet console.
 """
 import argparse, glob, os, re, shlex, subprocess, sys, time
 
@@ -71,6 +72,8 @@ class Serial:
             sys.exit('devsh: pyserial missing (pip install pyserial)')
         self.serial, self.user, self.o, self.s = serial, user, o, None
         self.seen = b''   # last console bytes of a failed open, for the error message
+        n, _, ms = os.environ.get('DEVSH_PACE', '16/4').partition('/')
+        self.pace = (max(1, int(n)), float(ms or 0) / 1000)
 
     def _read_until(self, pats, t):
         end, buf = time.time() + t, b''
@@ -86,10 +89,11 @@ class Serial:
     def _send(self, line):
         # Paced: busy consoles drop characters of a burst.
         data = line.encode() + b'\n'
-        for k in range(0, len(data), 16):
-            self.s.write(data[k:k + 16])
+        step, pause = self.pace
+        for k in range(0, len(data), step):
+            self.s.write(data[k:k + step])
             self.s.flush()
-            time.sleep(0.004)
+            time.sleep(pause)
 
     def open(self):
         ports = [self.o['port']] if self.o['port'] else sorted(glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*'))

@@ -9,6 +9,7 @@ General-purpose agent skills for Claude Code and the GitHub Copilot CLI.
 | `discover-e2e` | Drafts a `blackbox-e2e` scenario (steps, log patterns, SQL fixtures, actions) with a cheap Copilot CLI scout that reads the source read-only and drives the app through the `e2e` verbs, then optionally verifies the draft with the real tester. Proposes product-map additions. | Claude, Copilot |
 | `ui-drive` | `uidrive` CLI: screenshots, taps, swipes and recordings on local or remote X11 displays. `blackbox-e2e` depends on it. | Claude, Copilot |
 | `board-discovery` | Read-only inventory of an embedded Linux board over serial, ssh, adb or locally (`devsh` transport + `discover` snapshots, per-app deep-dives, drift diffs, workspace-to-board matching), then a method and templates to generate a board-specific skill. Needs `pyserial` for serial targets. | Claude, Copilot |
+| `serial-xfer` | `sxfer` CLI: push/pull a file to or from an embedded Linux board over a serial console as base64 (gzip, chunked resume, retries, sha256/md5 check) for boards with no network and no lrzsz; also works over ssh/adb/local. Depends on `board-discovery` (uses its `devsh` transport); needs `pyserial` for serial targets. | Claude, Copilot |
 
 ## Install
 

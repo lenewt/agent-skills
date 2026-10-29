@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+"""sxfer - copy a file to or from a board through its shell (serial console), as base64 text.
+
+Usage:
+  sxfer [-T TARGET] push LOCAL REMOTE [--mode 0755] [--no-gzip] [--no-resume] [--no-clobber]
+  sxfer [-T TARGET] pull REMOTE LOCAL [--gzip]
+  sxfer [-T TARGET] --check          # which of base64 / gzip / md5sum / sha256sum the board has
+
+For boards with a console but no network and no lrzsz. Uses the `devsh` transport of the board-discovery
+skill, so TARGET (or $DEVSH_TARGET), -u/$DEVSH_USER, $DEVSH_PASSWORD, --noise and -t are the same as there
+(serial[:port][@baud], ssh:[user@]host[:port], adb[:serial], local). --pace BYTES/MS sets $DEVSH_PACE.
+Prefer scp or `adb push` whenever the board has a network or adb.
+
+push: gzip on the host when the board has gzip/gunzip and it helps, then ~2000 base64 chars per
+`printf %s '...' >> REMOTE.b64.part` line. The size is checked every 8 chunks (a console drops characters
+under load); a failed or timed-out chunk is retried 3 times. REMOTE.b64.part is kept after an interruption,
+and the next run resumes from it (after comparing a checksum of the part already there). The board decodes to
+REMOTE.part, size and sha256 (else md5) are checked against the host, then it is moved over REMOTE
+(REMOTE is untouched on any failure).
+pull: reads the file in 16 KB ranges with dd, checks each range's length, and checks the whole against the
+board's checksum before replacing LOCAL.
+Exit: 0 ok, 1 transfer or verify failure, 2 target unreachable.
+"""
+import argparse, base64, binascii, gzip, hashlib, importlib.machinery, importlib.util, os, posixpath, re, shlex, sys, time
+
+sys.dont_write_bytecode = True
+_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', '..', 'board-discovery', 'bin', 'devsh')
+if not os.path.exists(_path):
+    sys.exit('sxfer: needs the board-discovery skill (bin/devsh) next to this skill; run install.sh')
+_loader = importlib.machinery.SourceFileLoader('devsh', _path)
+_spec = importlib.util.spec_from_loader('devsh', _loader)
+devsh = importlib.util.module_from_spec(_spec)
+_loader.exec_module(devsh)
+
+q = shlex.quote
+TRIES = 3            # per chunk, and per size checkpoint
+CKPT_CHUNKS = 8      # verify the part's size every this many chunks
+PULL_RANGE = 16384   # bytes per dd range (a multiple of the 1024 block size)
+CMD_LIMIT = 2900     # devsh refuses > 3000 characters
+HASHES = {'sha256sum': hashlib.sha256, 'md5sum': hashlib.md5}
+PROBE = ('for c in base64 gzip gunzip md5sum sha256sum; do if command -v $c >/dev/null 2>&1; '
+         'then echo "$c=yes"; else echo "$c=no"; fi; done; echo "b64dec=$(printf YWJj | base64 -d 2>/dev/null)"')
+
+
+class XferError(Exception):
+    pass
+
+
+class Board:
+    """A devsh session: unique marker ids, console noise and colour codes removed from the output."""
+
+    def __init__(self, t, noise, timeout):
+        self.t, self.timeout, self.n = t, timeout, 0
+        self.noise = re.compile(noise) if noise else None
+
+    def run(self, cmd, timeout=None):
+        self.n += 1
+        rc, text = self.t.run(self.n, cmd, timeout or self.timeout)
+        text = devsh.ANSI.sub('', text)
+        if self.noise:
+            text = '\n'.join(l for l in text.split('\n') if not self.noise.search(l))
+        return rc, text
+
+    def size(self, path):
+        rc, text = self.run(f'wc -c < {q(path)}')
+        m = re.search(r'^\s*(\d+)\s*$', text, re.M)
+        return int(m.group(1)) if rc == 0 and m else None
+
+    def digest(self, feed, tool, size):
+        """Checksum of the stream `feed` (a command) on the board, or None."""
+        rc, text = self.run(f'{feed} | {tool}', max(self.timeout, 30 + size / 100000))
+        m = re.search(r'\b[0-9a-f]{%d}\b' % (HASHES[tool]().digest_size * 2), text)
+        return m.group(0) if rc == 0 and m else None
+
+    def truncate(self, path, n):
+        p = q(path)
+        self.run(f'truncate -s {n} {p} 2>/dev/null || dd if=/dev/null of={p} bs=1 seek={n} count=0 2>/dev/null'
+                 f' || {{ head -c {n} {p} > {p}.t && mv {p}.t {p}; }}')
+        if self.size(path) != n:
+            raise XferError(f'cannot truncate {path} to {n} bytes')
+
+    def kind(self, path):
+        rc, text = self.run(f'if [ -d {q(path)} ]; then echo KIND=dir; elif [ -e {q(path)} ]; then echo KIND=file; '
+                            f'else echo KIND=none; fi')
+        m = re.search(r'^KIND=(\w+)', text, re.M)
+        return m.group(1) if m else None
+
+
+class Progress:
+    """Progress in file bytes; update() takes the position in the stream sent, `scale` converts it."""
+
+    def __init__(self, label, total, scale=1.0, pos=0):
+        self.label, self.total, self.scale, self.base, self.t0 = label, total, scale, int(pos * scale), time.time()
+        self.last, self.tty = 0.0, sys.stderr.isatty()
+
+    def update(self, pos, force=False):
+        done = int(pos * self.scale)
+        now = time.time()
+        if not force and now - self.last < (0.5 if self.tty else 5):
+            return
+        self.last = now
+        rate = (done - self.base) / max(now - self.t0, 1e-6)
+        eta = f'{(self.total - done) / rate:.0f}s' if rate > 0 else '?'
+        pct = 100 * done // self.total if self.total else 100
+        line = f'{self.label} {human(done)}/{human(self.total)} ({pct}%) {human(rate)}/s ETA {eta}'
+        sys.stderr.write(('\r%s\x1b[K' if self.tty else '%s\n') % line)
+        sys.stderr.flush()
+
+    def end(self):
+        if self.tty:
+            sys.stderr.write('\n')
+
+
+def human(n):
+    for unit in ('B', 'KB', 'MB'):
+        if n < 1024 or unit == 'MB':
+            return f'{n:.0f} B' if unit == 'B' else f'{n:.1f} {unit}'
+        n /= 1024
+
+
+def probe(b):
+    rc, text = b.run(PROBE, 20)
+    return dict(re.findall(r'^(\w+)=(\w*)\s*$', text, re.M))
+
+
+def pick_hash(caps):
+    for tool in ('sha256sum', 'md5sum'):
+        if caps.get(tool) == 'yes':
+            return tool
+    print('!! warning: the board has neither sha256sum nor md5sum; only the size is verified', file=sys.stderr)
+    return None
+
+
+def check(b):
+    caps = probe(b)
+    for k in ('base64', 'gzip', 'gunzip', 'md5sum', 'sha256sum'):
+        print(f'{k}: {caps.get(k, "?")}')
+    print(f'base64 -d: {"works" if caps.get("b64dec") == "abc" else "NOT working"}')
+    return 0 if caps.get('base64') == 'yes' and caps.get('b64dec') == 'abc' else 1
+
+
+def rollback(b, path, ckpt):
+    """After a failed chunk: cut the part back to its last verified size. The sizes since then are not trusted:
+    a chunk that was lost earlier would make a later one look like the expected size."""
+    for _ in range(TRIES):
+        size = b.size(path)
+        if size is not None:
+            break
+    else:
+        raise XferError(f'console not responding while recovering {path}')
+    if size < ckpt:
+        raise XferError(f'{path} lost data it had verified ({size} < {ckpt} bytes)')
+    if size != ckpt:
+        b.truncate(path, ckpt)
+    return ckpt
+
+
+def start_part(b, tmp, wire, chunk, tool, resume):
+    """Position to continue from: the whole chunks of an existing part that matches, else 0 (fresh part)."""
+    size = b.size(tmp) if resume else None
+    pos = (size or 0) // chunk * chunk
+    if pos and size <= len(wire):
+        if not tool or b.digest(f'head -c {pos} {q(tmp)}', tool, pos) == HASHES[tool](wire[:pos].encode()).hexdigest():
+            if size != pos:
+                b.truncate(tmp, pos)
+            return pos
+    rc, text = b.run(f': > {q(tmp)}')
+    if rc != 0:
+        raise XferError(f'cannot create {tmp}: {text.strip()}')
+    return 0
+
+
+def send_chunks(b, tmp, wire, chunk, pos, prog):
+    ckpt, cfail, kfail = pos, 0, 0
+    while pos < len(wire):
+        piece = wire[pos:pos + chunk]
+        cmd = f"printf %s '{piece}' >> {q(tmp)}"
+        if len(cmd) > CMD_LIMIT:
+            raise XferError('remote path too long for the chunk size (use --chunk)')
+        rc, text = b.run(cmd)
+        if rc != 0:
+            cfail += 1
+            if cfail >= TRIES:
+                raise XferError(f'chunk at {pos} failed {TRIES} times (disk full? read-only? console busy?): '
+                                f'{text.strip()[-200:]}')
+            pos = rollback(b, tmp, ckpt)
+            continue
+        cfail, pos = 0, pos + len(piece)
+        if pos == len(wire) or pos % (chunk * CKPT_CHUNKS) == 0:
+            if b.size(tmp) == pos:
+                ckpt, kfail = pos, 0
+            else:
+                kfail += 1
+                if kfail >= TRIES:
+                    raise XferError(f'{tmp} keeps coming out at the wrong size (characters lost on the console; '
+                                    f'try a slower --pace)')
+                b.truncate(tmp, ckpt)
+                pos = ckpt
+        prog.update(pos)
+
+
+def push(b, a):
+    try:
+        data = open(a.local, 'rb').read()
+    except OSError as e:
+        raise XferError(f'cannot read {a.local}: {e.strerror}')
+    caps = probe(b)
+    if caps.get('base64') != 'yes' or caps.get('b64dec') != 'abc':
+        raise XferError('the board has no working `base64 -d` (see --check)')
+    gunzip = 'gzip -dc' if caps.get('gzip') == 'yes' else 'gunzip -c' if caps.get('gunzip') == 'yes' else None
+    payload = data
+    if gunzip and not a.no_gzip and data:
+        comp = gzip.compress(data, 9, mtime=0)
+        payload = comp if len(comp) < len(data) else data
+    gz = payload is not data
+    wire = base64.b64encode(payload).decode()
+    tool = pick_hash(caps)
+
+    dest = a.remote
+    kind = b.kind(dest)
+    if kind == 'dir':
+        dest = posixpath.join(dest, os.path.basename(a.local))
+        kind = b.kind(dest)
+    if kind == 'file':
+        if a.no_clobber:
+            raise XferError(f'{dest} exists (--no-clobber)')
+        print(f'!! replacing existing {dest}', file=sys.stderr)
+    folder = posixpath.dirname(dest) or '.'
+    rc, text = b.run(f'[ -d {q(folder)} ] && [ -w {q(folder)} ]')
+    if rc != 0:
+        raise XferError(f'{folder} is not a writable directory on the board (read-only rootfs? check `mount`)')
+    tmp, part = dest + '.b64.part', dest + '.part'
+
+    pos = start_part(b, tmp, wire, a.chunk, tool, not a.no_resume)
+    if pos:
+        print(f'resuming {tmp} at {pos}/{len(wire)}', file=sys.stderr)
+    prog = Progress('push', len(data), len(data) / len(wire) if wire else 0, pos)
+    t0 = time.time()
+    send_chunks(b, tmp, wire, a.chunk, pos, prog)
+    prog.update(len(wire), True)
+    prog.end()
+
+    want = HASHES[tool](data).hexdigest() if tool else None
+    decode = f'base64 -d < {q(tmp)}' + (f' | {gunzip}' if gz else '') + f' > {q(part)}'
+    rc, text = b.run(f'{decode} && wc -c < {q(part)}' + (f' && {tool} < {q(part)}' if tool else ''),
+                     max(b.timeout, 30 + len(data) / 20000))
+    m = re.search(r'^\s*(\d+)\s*$', text, re.M)
+    got = re.search(r'\b[0-9a-f]{%d}\b' % (HASHES[tool]().digest_size * 2), text) if tool else None
+    if rc != 0 or not m or int(m.group(1)) != len(data) or (tool and (not got or got.group(0) != want)):
+        b.run(f'rm -f {q(part)}' + ('' if rc == -1 else f' {q(tmp)}'))
+        raise XferError(f'verification failed on the board (rc={rc}, size {m.group(1) if m else "?"} != {len(data)}'
+                        f'{", checksum differs" if got and got.group(0) != want else ""}); '
+                        + ('the part is kept: rerun to resume' if rc == -1 else 'the part was removed: rerun'))
+    chmod = f'chmod {a.mode} {q(part)} && ' if a.mode else ''
+    rc, text = b.run(f'{chmod}mv -f {q(part)} {q(dest)} && rm -f {q(tmp)}')
+    if rc != 0:
+        b.run(f'rm -f {q(part)}')
+        raise XferError(f'cannot move into place: {text.strip()}')
+    dt = max(time.time() - t0, 1e-6)
+    print(f'OK push {a.local} -> {dest}  {len(data)} bytes  '
+          f'{(tool or "size only").replace("sum", "")} {want or ""}  '
+          f'{"gzip " if gz else ""}{human(len(data) / dt)}/s')
+    return 0
+
+
+def pull(b, a):
+    caps = probe(b)
+    if caps.get('base64') != 'yes':
+        raise XferError('the board has no base64 (see --check)')
+    src = a.remote
+    rc, text = b.run(f'[ -f {q(src)} ] && [ -r {q(src)} ]')
+    if rc != 0:
+        raise XferError(f'{src} is not a readable regular file on the board')
+    total = b.size(src)
+    if total is None:
+        raise XferError(f'cannot read the size of {src}')
+    tool = pick_hash(caps)
+    want = b.digest(f'cat {q(src)}', tool, total) if tool else None
+    if tool and not want:
+        raise XferError(f'cannot checksum {src}')
+    gz = a.gzip and caps.get('gzip') == 'yes'
+    if a.gzip and not gz:
+        print('!! no gzip on the board: sending uncompressed', file=sys.stderr)
+    out, prog, t0 = bytearray(), Progress('pull', total), time.time()
+    for off in range(0, total, PULL_RANGE):
+        n = min(PULL_RANGE, total - off)
+        cmd = (f'dd if={q(src)} bs=1024 skip={off // 1024} count={PULL_RANGE // 1024} 2>/dev/null'
+               + (' | gzip -c' if gz else '') + ' | base64')
+        for attempt in range(TRIES):
+            rc, text = b.run(cmd)
+            try:
+                got = base64.b64decode(re.sub(r'\s+', '', text), validate=True)
+                got = gzip.decompress(got) if gz else got
+            except (binascii.Error, OSError, EOFError):
+                got = None
+            if got is not None and len(got) == n:
+                break
+        else:
+            raise XferError(f'range at {off} of {src} failed {TRIES} times (rc={rc}): {text.strip()[-200:]}')
+        out += got
+        prog.update(len(out))
+    prog.update(total, True)
+    prog.end()
+    have = HASHES[tool](out).hexdigest() if tool else None
+    if have != want:
+        raise XferError(f'checksum mismatch: board {want}, received {have}'
+                        + (' (size 0 on a pseudo file such as /proc or /sys: `cat` it to /tmp first)' if not total else ''))
+    dest = a.local
+    if os.path.isdir(dest):
+        dest = os.path.join(dest, posixpath.basename(src))
+    tmp = os.path.join(os.path.dirname(os.path.abspath(dest)), f'.{os.path.basename(dest)}.sxfer.{os.getpid()}')
+    try:
+        with open(tmp, 'wb') as f:
+            f.write(out)
+        os.replace(tmp, dest)
+    except OSError as e:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise XferError(f'cannot write {dest}: {e.strerror}')
+    dt = max(time.time() - t0, 1e-6)
+    print(f'OK pull {src} -> {dest}  {total} bytes  {(tool or "size only").replace("sum", "")} {want or ""}  '
+          f'{"gzip " if gz else ""}{human(total / dt)}/s')
+    return 0
+
+
+def parser():
+    common = argparse.ArgumentParser(add_help=False)   # also accepted after the sub-command
+    parent = argparse.ArgumentParser(add_help=False)
+    for p, d in ((parent, None), (common, argparse.SUPPRESS)):
+        def dflt(v):
+            return d if d is not None else v
+        p.add_argument('-T', '--target', default=dflt(os.environ.get('DEVSH_TARGET', 'serial')))
+        p.add_argument('-t', '--timeout', type=float, default=dflt(float(os.environ.get('DEVSH_TIMEOUT', 30))),
+                       help='seconds per board command')
+        p.add_argument('-u', '--user', default=dflt(os.environ.get('DEVSH_USER', 'root')))
+        p.add_argument('--noise', default=dflt(os.environ.get('DEVSH_NOISE')), help='drop output lines matching this regex')
+        p.add_argument('--pace', default=dflt(None), metavar='BYTES/MS', help='serial write pacing (default 16/4)')
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 parents=[parent])
+    ap.add_argument('--check', action='store_true', help='report the board tools sxfer uses')
+    sub = ap.add_subparsers(dest='op')
+    p = sub.add_parser('push', parents=[common], help='LOCAL REMOTE')
+    p.add_argument('local')
+    p.add_argument('remote')
+    p.add_argument('--mode', type=lambda s: s if re.fullmatch(r'[0-7]{3,4}', s) else ap.error('--mode: octal, e.g. 0755'))
+    p.add_argument('--no-gzip', action='store_true')
+    p.add_argument('--no-resume', action='store_true')
+    p.add_argument('--no-clobber', action='store_true', help='fail if REMOTE already exists')
+    p.add_argument('--chunk', type=int, default=2000, help='base64 characters per command (default 2000)')
+    p = sub.add_parser('pull', parents=[common], help='REMOTE LOCAL')
+    p.add_argument('remote')
+    p.add_argument('local')
+    p.add_argument('--gzip', action='store_true', help='compress each range on the board (text files)')
+    return ap
+
+
+def main():
+    ap = parser()
+    a = ap.parse_args()
+    if not a.check and not a.op:
+        ap.error('need push, pull or --check')
+    if a.pace:
+        os.environ['DEVSH_PACE'] = a.pace
+    t = devsh.connect(a.target, a.user)
+    if not t.open():
+        print(f'!! no shell on {a.target} (powered, cabled, right port/baud/host? still booting?)', file=sys.stderr)
+        seen = getattr(t, 'seen', b'')
+        if seen:
+            print(f'!! last console output: {seen.decode("utf-8", "replace").replace(chr(13), "").strip()[-200:]!r}',
+                  file=sys.stderr)
+        return 2
+    b = Board(t, a.noise, a.timeout)
+    try:
+        if a.check:
+            return check(b)
+        return push(b, a) if a.op == 'push' else pull(b, a)
+    except XferError as e:
+        print(f'!! {e}', file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print('\n!! interrupted (a push can be resumed by rerunning it)', file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
