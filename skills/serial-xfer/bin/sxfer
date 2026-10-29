@@ -21,7 +21,7 @@ pull: reads the file in 16 KB ranges with dd, checks each range's length, and ch
 board's checksum before replacing LOCAL.
 Exit: 0 ok, 1 transfer or verify failure, 2 target unreachable.
 """
-import argparse, base64, binascii, gzip, hashlib, importlib.machinery, importlib.util, os, posixpath, re, shlex, sys, time
+import argparse, base64, binascii, gzip, hashlib, importlib.machinery, importlib.util, os, posixpath, re, shlex, sys, time, zlib
 
 sys.dont_write_bytecode = True
 _path = os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', '..', 'board-discovery', 'bin', 'devsh')
@@ -291,7 +291,7 @@ def pull(b, a):
             try:
                 got = base64.b64decode(re.sub(r'\s+', '', text), validate=True)
                 got = gzip.decompress(got) if gz else got
-            except (binascii.Error, OSError, EOFError):
+            except (binascii.Error, OSError, EOFError, zlib.error):
                 got = None
             if got is not None and len(got) == n:
                 break
