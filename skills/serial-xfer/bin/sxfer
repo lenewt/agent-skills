@@ -2,7 +2,7 @@
 """sxfer - copy a file to or from a board through its shell (serial console), as base64 text.
 
 Usage:
-  sxfer [-T TARGET] push LOCAL REMOTE [--mode 0755] [--no-gzip] [--no-resume] [--no-clobber]
+  sxfer [-T TARGET] push LOCAL REMOTE [--mode 0755] [--no-gzip] [--no-resume] [--no-clobber] [--chunk N]
   sxfer [-T TARGET] pull REMOTE LOCAL [--gzip]
   sxfer [-T TARGET] --check          # which of base64 / gzip / md5sum / sha256sum the board has
 

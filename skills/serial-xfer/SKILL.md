@@ -7,12 +7,13 @@ description: Transfer a file to or from an embedded Linux board over its serial 
 
 One tool, `bin/sxfer`, Python 3 on the host. It needs the **board-discovery** skill next to it (it loads that skill's
 `bin/devsh` for the transport: login, markers, console-noise handling) and `pyserial` for serial targets. The board needs
-only a shell with `base64` (`-d`), `printf`, `wc`, `mv`; `gzip` and `sha256sum`/`md5sum` are used when present.
+only a shell with `base64` (`-d`), `printf`, `wc`, `head`, `mv`, `dd` (pull) and `truncate` (else `dd`/`head`, to roll
+back a bad chunk); `gzip` and `sha256sum`/`md5sum` are used when present.
 
 | Command | Does |
 |---|---|
 | `sxfer -T TARGET --check` | which of base64 / gzip / gunzip / md5sum / sha256sum the board has, and whether `base64 -d` works |
-| `sxfer -T TARGET push LOCAL REMOTE [--mode 0755] [--no-gzip] [--no-resume] [--no-clobber]` | host gzip when it helps, base64 chunks appended to `REMOTE.b64.part`, decode to `REMOTE.part`, size + checksum check, `mv` over REMOTE, temp files removed |
+| `sxfer -T TARGET push LOCAL REMOTE [--mode 0755] [--no-gzip] [--no-resume] [--no-clobber] [--chunk N]` | host gzip when it helps, base64 chunks appended to `REMOTE.b64.part`, decode to `REMOTE.part`, size + checksum check, `mv` over REMOTE, temp files removed |
 | `sxfer -T TARGET pull REMOTE LOCAL [--gzip]` | size + checksum on the board, 16 KB `dd | base64` ranges, each range length-checked, whole file checksum-checked, LOCAL written atomically |
 
 TARGET (or `$DEVSH_TARGET`), `-u`/`$DEVSH_USER`, `$DEVSH_PASSWORD`, `--noise REGEX`, `-t SECONDS` (per board command):

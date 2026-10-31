@@ -72,8 +72,11 @@ class Serial:
             sys.exit('devsh: pyserial missing (pip install pyserial)')
         self.serial, self.user, self.o, self.s = serial, user, o, None
         self.seen = b''   # last console bytes of a failed open, for the error message
-        n, _, ms = os.environ.get('DEVSH_PACE', '16/4').partition('/')
-        self.pace = (max(1, int(n)), float(ms or 0) / 1000)
+        pace = os.environ.get('DEVSH_PACE', '16/4')
+        m = re.fullmatch(r'(\d+)(?:/(\d+(?:\.\d*)?))?', pace)
+        if not m:
+            sys.exit(f'devsh: DEVSH_PACE={pace!r}: expected BYTES/MS, e.g. 16/4')
+        self.pace = (max(1, int(m.group(1))), float(m.group(2) or 0) / 1000)
 
     def _read_until(self, pats, t):
         end, buf = time.time() + t, b''
