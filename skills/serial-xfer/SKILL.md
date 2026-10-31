@@ -36,8 +36,9 @@ Progress goes to stderr; the last stdout line is `OK push|pull ... <checksum>`. 
 ## Throughput and tuning
 
 ~11 KB/s raw at 115200 baud, base64 adds 33%, so 1 MB takes about 2 min (gzip makes text and unstripped binaries much
-smaller; random or already-compressed data is sent as is). devsh paces writes 16 bytes / 4 ms by default, which caps a push
-near 3 KB/s: on a quiet console try `--pace 64/1` (or `$DEVSH_PACE`); lost characters are caught by the size check every
+smaller; random or already-compressed data is sent as is). sxfer paces writes 64 bytes / 1 ms (`--pace`, or `$DEVSH_PACE`;
+devsh itself defaults to 16/4). Measured on a quiet 115200 console: push 2.7 KB/s at 64/1 against 0.8 KB/s at
+16/4, pull 7.2 KB/s. On a busy console that drops characters, slow down with `--pace 16/4`; lost characters are caught by the size check every
 8 chunks, which rolls back and resends, and a persistent mismatch aborts telling you to slow down. A failed or timed-out
 chunk is retried 3 times. Raise `-t` for a big file's decode and checksum on a slow CPU.
 

@@ -8,7 +8,7 @@ Usage:
 
 For boards with a console but no network and no lrzsz. Uses the `devsh` transport of the board-discovery
 skill, so TARGET (or $DEVSH_TARGET), -u/$DEVSH_USER, $DEVSH_PASSWORD, --noise and -t are the same as there
-(serial[:port][@baud], ssh:[user@]host[:port], adb[:serial], local). --pace BYTES/MS sets $DEVSH_PACE.
+(serial[:port][@baud], ssh:[user@]host[:port], adb[:serial], local). --pace BYTES/MS sets $DEVSH_PACE (default 64/1).
 Prefer scp or `adb push` whenever the board has a network or adb.
 
 push: gzip on the host when the board has gzip/gunzip and it helps, then ~2000 base64 chars per
@@ -334,7 +334,8 @@ def parser():
                        help='seconds per board command')
         p.add_argument('-u', '--user', default=dflt(os.environ.get('DEVSH_USER', 'root')))
         p.add_argument('--noise', default=dflt(os.environ.get('DEVSH_NOISE')), help='drop output lines matching this regex')
-        p.add_argument('--pace', default=dflt(None), metavar='BYTES/MS', help='serial write pacing (default 16/4)')
+        p.add_argument('--pace', default=dflt(os.environ.get('DEVSH_PACE', '64/1')), metavar='BYTES/MS',
+                       help='serial write pacing (default $DEVSH_PACE, else 64/1)')
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
                                  parents=[parent])
     ap.add_argument('--check', action='store_true', help='report the board tools sxfer uses')
@@ -359,8 +360,7 @@ def main():
     a = ap.parse_args()
     if not a.check and not a.op:
         ap.error('need push, pull or --check')
-    if a.pace:
-        os.environ['DEVSH_PACE'] = a.pace
+    os.environ['DEVSH_PACE'] = a.pace
     t = devsh.connect(a.target, a.user)
     if not t.open():
         print(f'!! no shell on {a.target} (powered, cabled, right port/baud/host? still booting?)', file=sys.stderr)
