@@ -23,7 +23,9 @@
 # The profile defaults to the scenario's "Target: <name>", looked up in $E2E_PROFILE_PATH
 # (colon-separated dirs), then in this skill's profiles/. Prints the per-step verdict, the
 # total cost and wall time, writes <run>/report.md and appends to $STATE_DIR/e2e-runs.jsonl
-# and to $STATE_DIR/usage.jsonl (skill, engine, model, cost, wall time only; skill = $E2E_SKILL).
+# and to the global usage ledger $E2E_USAGE_LOG (default ~/.local/state/blackbox-e2e/usage.jsonl,
+# whatever the profile's STATE_DIR): skill (= $E2E_SKILL), engine, model, cost, wall time and the
+# calling session's id and cumulative cost (bin/session-cost), nothing about the scenario.
 # The engine defaults to $E2E_ENGINE, then to the calling session's tool (copilot inside a Copilot session).
 # shellcheck source-path=SCRIPTDIR
 set -euo pipefail
@@ -179,16 +181,23 @@ if [ "$MODE" = scout ] && [ "$DIRTY" = 0 ]; then
 fi
 # usage_log COST WALL: the skills' cost ledger, one line per tester run and nothing about the
 # scenario (bin/e2e-usage). Once per run: after the tester, or on INT/TERM once it has started.
+# One global file, not under STATE_DIR: profiles that set their own must not split it.
+USAGE_LOG=${E2E_USAGE_LOG:-${XDG_STATE_HOME:-$HOME/.local/state}/blackbox-e2e/usage.jsonl}
 TESTER=0
 usage_log() {
-    local skill=${E2E_SKILL:-blackbox-e2e} cost=$1
+    local skill=${E2E_SKILL:-blackbox-e2e} cost=$1 session
     [ "$TESTER" = 1 ] || return 0
     TESTER=logged
     [ -n "${E2E_SKILL:-}" ] || [ "$MODE" != white-box ] || skill=whitebox-e2e
     [[ "$cost" =~ ^[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?$ ]] || cost=0
+    # The caller's session (this process's env, not the tester's); best effort, null if unknown.
+    session=$(timeout 3 "$BIN/session-cost" 2> /dev/null) || session=null
+    jq -e 'type == "object" or type == "null"' <<< "$session" > /dev/null 2>&1 || session=null
+    mkdir -p "$(dirname "$USAGE_LOG")" 2> /dev/null || true
     jq -nc --arg date "$(date -Iseconds)" --arg skill "$skill" --arg engine "$ENGINE" --arg model "$MODEL" \
-        --argjson cost "$cost" --argjson wall "$2" \
-        '{date:$date, skill:$skill, engine:$engine, model:$model, cost_usd:$cost, wall_s:$wall}' >> "$STATE/usage.jsonl" || true
+        --argjson cost "$cost" --argjson wall "$2" --argjson session "$session" \
+        '{date:$date, skill:$skill, engine:$engine, model:$model, cost_usd:$cost, wall_s:$wall, session:$session}' \
+        >> "$USAGE_LOG" || true
 }
 trap teardown EXIT
 trap 'usage_log "$(jq -r ".cost_usd // 0" "$RUN/tester.json" 2> /dev/null || echo 0)" $(( $(date +%s) - T0 )); exit 130' INT TERM

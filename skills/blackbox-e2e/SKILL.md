@@ -140,11 +140,20 @@ The runner prints `report.md`: verdict, step table, ≤ 2 screenshot paths, key 
 turns, `e2e` calls, screenshots, wall time and denied tool calls. It appends one line (with `profile`) to
 `$STATE_DIR/e2e-runs.jsonl` (default `~/.local/state/blackbox-e2e/`) and prints the cumulative cost.
 
-Every run that reached the tester or scout (any verdict) also appends one line to `$STATE_DIR/usage.jsonl`:
-`{date, skill, engine, model, cost_usd, wall_s}`. It holds nothing about the scenario (no title, profile, target,
-verdict or path). `skill` is `$E2E_SKILL` (set by the discover-e2e, whitebox-e2e and instrument-e2e wrappers), else
-`whitebox-e2e` with `--source`, else `blackbox-e2e`. `bin/e2e-usage [--since YYYY-MM-DD] [--json]` prints runs, total
-and mean cost per skill, and the grand total (`STATE_DIR=…` for a profile that sets its own).
+Every run that reached the tester or scout (any verdict) also appends one line to one global ledger,
+`~/.local/state/blackbox-e2e/usage.jsonl` (`$E2E_USAGE_LOG` overrides it; a profile's `STATE_DIR` does not):
+`{date, skill, engine, model, cost_usd, wall_s, session}`. It holds nothing about the scenario (no title, profile,
+target, verdict or path). `skill` is `$E2E_SKILL` (set by the discover-e2e, whitebox-e2e and instrument-e2e
+wrappers), else `whitebox-e2e` with `--source`, else `blackbox-e2e`. `session` is the calling dev session, or null:
+
+| Tool | Found by | `cost_usd` (cumulative, testers excluded) |
+|---|---|---|
+| `claude` | `CLAUDE_CODE_SESSION_ID`, nearest `claude` ancestor process | transcript `cost-state` records: sum of the last `totalCostUSD` per process (`startTime`); null until one is written |
+| `copilot` | `COPILOT_AGENT_SESSION_ID`, nearest `copilot` ancestor process | `~/.copilot/session-store.db`: AI credits × $0.01, plus `premium_requests` |
+
+`bin/session-cost` computes it (best effort, never fails the run). `bin/e2e-usage [--since YYYY-MM-DD] [--json]`
+prints runs, total and mean cost per skill with the grand total, then per session: e2e runs and cost, the last
+known session cost and the e2e share of both, e2e / (session + e2e).
 
 On FAIL, look at the screenshot and log lines yourself before blaming the product: a vague step or a wrong regex
 is fixed in the scenario. Denied tool calls mean the tester tried to leave its box; mention them.
@@ -154,7 +163,8 @@ PASS. Report each deviation to the user next to the verdict: it is either a scen
 
 ## Files
 
-`bin/e2e-run.sh` runner · `bin/e2e` tester verbs · `bin/e2e-lint.sh` · `bin/e2e-usage` cost per skill ·
-`lib/stack.sh` profile helpers · `profiles/` built-in profiles · `templates/brief.md` (tester brief) ·
-`templates/report.schema.json` · `templates/scenario.example.md`. A run dir holds `sandbox/` (the tester's cwd: `shots/` only) and `priv/` (shim,
-`e2e.env`, prompt, process output, `calls.log`); `result.json(l)` is the raw tester output, `tester.json` normalised.
+`bin/e2e-run.sh` runner · `bin/e2e` tester verbs · `bin/e2e-lint.sh` · `bin/e2e-usage` cost per skill and session ·
+`bin/session-cost` · `lib/stack.sh` profile helpers · `profiles/` built-in profiles · `templates/brief.md` (tester
+brief) · `templates/report.schema.json` · `templates/scenario.example.md`. A run dir holds `sandbox/` (the tester's
+cwd: `shots/` only) and `priv/` (shim, `e2e.env`, prompt, process output, `calls.log`); `result.json(l)` is the raw
+tester output, `tester.json` normalised.
