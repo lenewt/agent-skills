@@ -15,13 +15,15 @@
 # --source DIR is white-box mode (Copilot only): the tester may also read DIR (file viewer,
 # grep, glob, `e2e git log|show|diff|blame|grep`), still without writing or running anything.
 #
-# --scout DIR is discovery mode (discover-e2e skill, Copilot + --source only): SCENARIO.md is a
-# task stub, DIR holds brief.md and draft.schema.json, the scout gets extra verbs (grep, sql,
-# try-action), and the run writes <run>/draft.json instead of a verdict.
+# --scout DIR is discovery mode (discover-e2e and instrument-e2e, Copilot + --source only):
+# SCENARIO.md is a task stub, DIR holds brief.md, draft.schema.json and optionally check.jq (the
+# jq filter a valid draft passes), the scout gets extra verbs (grep, sql, try-action), and the
+# run writes <run>/draft.json instead of a verdict.
 #
 # The profile defaults to the scenario's "Target: <name>", looked up in $E2E_PROFILE_PATH
 # (colon-separated dirs), then in this skill's profiles/. Prints the per-step verdict, the
-# total cost and wall time, writes <run>/report.md and appends to $STATE_DIR/e2e-runs.jsonl.
+# total cost and wall time, writes <run>/report.md and appends to $STATE_DIR/e2e-runs.jsonl
+# and to $STATE_DIR/usage.jsonl (skill, engine, model, cost, wall time only; skill = $E2E_SKILL).
 # The engine defaults to $E2E_ENGINE, then to the calling session's tool (copilot inside a Copilot session).
 # shellcheck source-path=SCRIPTDIR
 set -euo pipefail
@@ -70,7 +72,7 @@ fi
 ENGINE=${ENGINE:-$(session_engine)} BUDGET=${BUDGET:-${E2E_BUDGET:-4}}
 case "$ENGINE" in
     claude)  MODEL=${MODEL:-haiku} ;;
-    copilot) MODEL=${MODEL:-gpt-6-luna} ;;
+    copilot) MODEL=${MODEL:-claude-haiku-5.5} ;;
     *) echo "--engine: claude or copilot" >&2; exit 2 ;;
 esac
 command -v "$ENGINE" > /dev/null || { echo "E2E: BLOCKED ($ENGINE CLI not installed)"; exit 3; }
@@ -175,8 +177,21 @@ if [ "$MODE" = scout ] && [ "$DIRTY" = 0 ]; then
     if declare -F profile_db_backup > /dev/null && profile_db_backup > /dev/null 2>&1; then DIRTY=1
     else : > "$PRIV/no-db-writes"; fi
 fi
+# usage_log COST WALL: the skills' cost ledger, one line per tester run and nothing about the
+# scenario (bin/e2e-usage). Once per run: after the tester, or on INT/TERM once it has started.
+TESTER=0
+usage_log() {
+    local skill=${E2E_SKILL:-blackbox-e2e} cost=$1
+    [ "$TESTER" = 1 ] || return 0
+    TESTER=logged
+    [ -n "${E2E_SKILL:-}" ] || [ "$MODE" != white-box ] || skill=whitebox-e2e
+    [[ "$cost" =~ ^[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?$ ]] || cost=0
+    jq -nc --arg date "$(date -Iseconds)" --arg skill "$skill" --arg engine "$ENGINE" --arg model "$MODEL" \
+        --argjson cost "$cost" --argjson wall "$2" \
+        '{date:$date, skill:$skill, engine:$engine, model:$model, cost_usd:$cost, wall_s:$wall}' >> "$STATE/usage.jsonl" || true
+}
 trap teardown EXIT
-trap 'exit 130' INT TERM
+trap 'usage_log "$(jq -r ".cost_usd // 0" "$RUN/tester.json" 2> /dev/null || echo 0)" $(( $(date +%s) - T0 )); exit 130' INT TERM
 if grep -qE '^--[[:space:]]*@fixture[[:space:]]+setup\b' "$FIXTURES"; then
     awk '/^--[[:space:]]*@(fixture|action)[[:space:]]/{ on = ($3 == "setup"); next } on' "$FIXTURES" > "$PRIV/fixture.sql"
     profile_fixture "$PRIV/fixture.sql" pre || blocked "setup fixture failed"
@@ -256,12 +271,14 @@ run_copilot() {
     # Prompt mode denies every tool call that no --allow-tool rule approves (verified:
     # cat, ../ reads and `e2e x; cat …` are refused). --disallow-temp-dir matters
     # because the run dir lives under /tmp. 1 AI credit = $0.01.
+    # USER is unset in some agent hosts (VS Code); set -u would abort the run.
+    local E2E_USER=${USER:-$(id -un)}
     local credits
     credits=$(awk -v b="$BUDGET" 'BEGIN { c = int(b * 100); print (c < 30 ? 30 : c) }')
     # Copilot auto-allows pwd, echo, which, printenv, date, whoami and read-only git
     # (file readers, ls, find, cd outside the cwd are denied), so the tester gets a
     # minimal environment: printenv then shows nothing secret.
-    local -a envkeep=(HOME="$HOME" USER="$USER" LOGNAME="${LOGNAME:-$USER}" PATH="$PATH"
+    local -a envkeep=(HOME="$HOME" USER="$E2E_USER" LOGNAME="${LOGNAME:-$E2E_USER}" PATH="$PATH"
         LANG="${LANG:-C.UTF-8}" TERM=dumb E2E_PRIV="$E2E_PRIV" E2E_BIN="$E2E_BIN")
     local v
     for v in XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS SSH_AUTH_SOCK; do
@@ -283,7 +300,11 @@ run_copilot() {
         "$RUN/result.jsonl" 2> /dev/null)
     # The report is the outermost {...} of the final message.
     local check='select(.verdict and (.steps | type) == "array")'
-    [ "$MODE" = scout ] && check='select((.scenario_md | type) == "string" and (.fixtures_sql | type) == "string")'
+    if [ "$MODE" = scout ]; then
+        # A scout dir may bring its own check (instrument-e2e); else a scenario draft (discover-e2e).
+        check='select((.scenario_md | type) == "string" and (.fixtures_sql | type) == "string")'
+        [ ! -f "$SCOUT/check.jq" ] || check=$(cat "$SCOUT/check.jq")
+    fi
     rep=$(perl -0ne 'print $1 if /(\{.*\})/s' <<< "$last" | jq -c "$check" 2> /dev/null || true)
     jq -sc --arg model "$MODEL" --argjson rep "${rep:-null}" \
         --slurpfile usage <(cat "$PRIV/copilot-usage.json" 2> /dev/null || echo '{}') '
@@ -298,7 +319,8 @@ run_copilot() {
         || jq -nc --arg model "$MODEL" '{engine: "copilot", model: $model, cost_usd: 0, turns: 0, denied: 0, stop: "unreadable output", report: null}' > "$RUN/tester.json"
 }
 
-RC=0
+RC=0 TESTER=1
+rm -f "$RUN/tester.json"   # a reused --out: the signal path must not log an old cost
 set +e
 "run_$ENGINE"
 set -e
@@ -309,6 +331,7 @@ teardown; trap - EXIT
 WALL=$(( $(date +%s) - T0 ))
 R="$RUN/tester.json"
 COST=$(jq -r '.cost_usd' "$R")
+usage_log "$COST" "$WALL"
 TURNS=$(jq -r '.turns' "$R")
 SUB=$(jq -r '.stop' "$R")
 REP=$(jq -c '.report // empty' "$R")
@@ -348,7 +371,7 @@ DEVIATIONS=$(jq '[.steps[]? | select(.status == "DEVIATION")] | length' <<< "$RE
     echo
     [ "$DEVIATIONS" = 0 ] || { echo "**$DEVIATIONS step(s) with DEVIATION:** the criterion held, but the screen differed from the step. Relay them to the user, do not report a plain PASS."; echo; }
     echo "| Step | Status | Evidence |"; echo "|---|---|---|"
-    jq -r '.steps[] | "| \(.n) | \(.status) | \(.evidence | gsub("\\|"; "/") | gsub("\n"; " ")) |"' <<< "$REP"
+    jq -r '.steps[] | "| \(.n) | \(.status) | \(.evidence // "" | tostring | gsub("\\|"; "/") | gsub("\n"; " ")) |"' <<< "$REP"
     echo
     jq -r '.screenshots[]? | "- screenshot: '"$SANDBOX"'/\(.)"' <<< "$REP"
     jq -r '.log_lines[]? | "    \(.)"' <<< "$REP"

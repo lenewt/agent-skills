@@ -34,6 +34,9 @@ tester will run later. That tester cannot read code: it only sees the screen and
    in the draft: SQL in the `setup` fixture (or in a named fixture that a step applies), action lines in a
    `-- @action NAME` block that a step applies at the same point. Changes you tried and dropped stay out. The
    runner lists every stimulus you applied and flags the ones the draft lacks.
+4. When a step cannot be observed or stimulated, do not invent a workaround. Write it under `open_questions` as
+   `cannot observe: X (looked at …)` or `cannot stimulate: X (looked at …)`, naming the logs, screens, verbs or
+   code you checked.
 
 ## The draft scenario (`scenario_md`)
 Markdown with exactly these parts:

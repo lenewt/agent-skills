@@ -115,8 +115,8 @@ case "$verb" in
         fi
         n=${2:-20}; is_int "$n" && [ "$n" -le 100 ] || die "N must be <= 100"
         [ -s "$E2E_PRIV/log-offsets" ] || die "stack not started by this run, or the profile has no logs"
-        while read -r f off; do
-            log_delta "$f" "$off" | grep -aE -- "$re" | sed "s|^|$(basename "$f"): |"
+        while read -r f off sum; do
+            log_delta "$f" "$off" "${sum:-}" | grep -aE -- "$re" | sed "s|^|$(basename "$f"): |"
         done < "$E2E_PRIV/log-offsets" \
             | perl -pe 's/[\w\/.-]+\.(?:c|cc|cpp|h|hpp|qml|js|jsx|ts|tsx|py|java|kt|go|rs):\d+/<src>/g; s/\b\w+(?:::\w+)+\(\)?/<fn>/g' \
             | cut -c1-800 | tail -n "$n" > "$E2E_PRIV/log.out"
@@ -157,7 +157,7 @@ case "$verb" in
         declare -F profile_action > /dev/null || die "this target has no action support"
         printf '%s\n' "$1" > "$E2E_PRIV/fixture.sql"
         profile_action try "$E2E_PRIV/fixture.sql" || die "action failed"
-        printf 'action %s\n' "$1" >> "$E2E_PRIV/stimuli.log"
+        [ "$1" = help ] || printf 'action %s\n' "$1" >> "$E2E_PRIV/stimuli.log"   # puppet help: no stimulus
         echo "action applied"
         ;;
     git)

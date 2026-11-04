@@ -18,7 +18,7 @@ bin/e2e-run.sh <scenario.md> [--source DIR] [--profile …] [--set k=v]… \
 ```
 
 `--source` defaults to `$E2E_SOURCE`, then to the git checkout of the current directory. The engine is always
-`copilot` (default model `gpt-6-luna`); the runner refuses white-box mode with `--engine claude`, because
+`copilot` (default model `claude-haiku-5.5`); the runner refuses white-box mode with `--engine claude`, because
 `claude -p --restricted` cannot grant read access to a second tree while keeping everything else denied. Project
 profiles work unchanged (point `E2E_PROFILE_PATH` at the project's profile folder).
 

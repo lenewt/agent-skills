@@ -1,0 +1,14 @@
+# instrument-e2e: add to the app's CMakeLists.txt. Copy E2ePuppet.h/.cpp next to it (e.g. src/e2e/).
+# Reuses the app's Qt major version (QT_VERSION_MAJOR, set by its own find_package). Needs Qt Network.
+option(E2E_PUPPET "Build the E2E puppet/trace points (test builds only, never release)" OFF)
+
+# The header is needed in every build: without E2E_PUPPET the E2E_* macros expand to nothing.
+target_include_directories(myapp PRIVATE src/e2e)
+
+if(E2E_PUPPET)
+    find_package(Qt${QT_VERSION_MAJOR} COMPONENTS Network REQUIRED)
+    target_sources(myapp PRIVATE src/e2e/E2ePuppet.cpp src/e2e/E2ePuppet.h)
+    target_compile_definitions(myapp PRIVATE E2E_PUPPET)
+    target_link_libraries(myapp PRIVATE Qt${QT_VERSION_MAJOR}::Network)
+endif()
+# Build for tests:  cmake -S . -B build-e2e -DE2E_PUPPET=ON

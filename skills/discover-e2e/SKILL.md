@@ -10,7 +10,7 @@ Paths in this file (`bin/…`, `templates/…`, `../<skill>/…`) are relative t
 A blackbox-e2e tester run costs about $0.005. Writing its scenario in the dev session costs orders of magnitude more:
 every screenshot, log grep and SQL try is one more call on a context of several hundred thousand tokens (one measured run: Opus
 calls at $0.4–0.9 each, dozens of them). `bin/discover-e2e` moves that exploration into a **scout**: a separate
-Copilot CLI process (gpt-6-luna by default), locked down like the white-box tester. It may read the source (read-only)
+Copilot CLI process (claude-haiku-5.5 by default), locked down like the white-box tester. It may read the source (read-only)
 and call `e2e` verbs, including scout-only `grep`, `sql` and `try-action`. It returns a draft. The dev session
 launches it, reads a few small files and decides.
 
@@ -35,6 +35,10 @@ bin/discover-e2e --profile NAME|FILE [--change RANGE] [--goal "…"] [--ticket F
 - Limits: `E2E_SCOUT_BUDGET` USD 0.5, 200 `e2e` calls, 40 screenshots.
 
 Project profiles come through `E2E_PROFILE_PATH`, as for blackbox-e2e.
+
+When `open-questions.md` says a step `cannot observe` or `cannot stimulate` something, the product needs debug
+lines, hooks or puppet points. Run the instrument-e2e skill (`../instrument-e2e/bin/instrument-e2e --profile … --from DRAFT_DIR`),
+apply its plan, and rerun discover once the product is equipped.
 
 ## Read the output (only these files)
 

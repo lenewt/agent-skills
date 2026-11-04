@@ -149,11 +149,11 @@ safety() {  # the map's Safety section, without the template's placeholder line
     s=$(safety || true)
     if [ -n "$s" ]; then echo "$s"; else echo "No restriction declared."; fi
 } > "$OUT/task.md"
-printf 'profile=%s\nmap=%s\ntitle=%s\n' "$PNAME" "$MAP" "$GOAL" > "$OUT/meta"
+printf 'profile=%s\npfile=%s\nchange=%s\nmap=%s\ntitle=%s\n' "$PNAME" "$PFILE" "$CHANGE" "$MAP" "$GOAL" > "$OUT/meta"
 
 # --- scout -----------------------------------------------------------------------------------
 set +e
-"$BB/bin/e2e-run.sh" "$OUT/task.md" --profile "$PFILE" --scout "$SKILL/templates" --source "$SOURCE" \
+E2E_SKILL=discover-e2e "$BB/bin/e2e-run.sh" "$OUT/task.md" --profile "$PFILE" --scout "$SKILL/templates" --source "$SOURCE" \
     --out "$OUT/scout" "${PASS[@]}" "${SCOUT_OPTS[@]}" > "$OUT/scout.log" 2>&1
 RC=$?
 set -e
@@ -206,7 +206,8 @@ fi
 if [ "$VERIFY" = 1 ]; then
     [ "$LINT_OK" = 1 ] || { echo "  verify: skipped (lint failed)"; exit 1; }
     set +e
-    "$BB/bin/e2e-run.sh" "$OUT/scenario.md" --profile "$PFILE" "${FIX[@]}" "${PASS[@]}" --out "$OUT/verify" > "$OUT/verify.log" 2>&1
+    # A blackbox-e2e run, also in usage.jsonl.
+    env -u E2E_SKILL "$BB/bin/e2e-run.sh" "$OUT/scenario.md" --profile "$PFILE" "${FIX[@]}" "${PASS[@]}" --out "$OUT/verify" > "$OUT/verify.log" 2>&1
     RC=$?
     set -e
     echo "  verify: $(head -n 1 "$OUT/verify/report.md" 2> /dev/null | sed 's/^# //' || echo "no report (rc $RC)"); $(grep -m1 -oE 'total cost \$[0-9.]+' "$OUT/verify/report.md" 2> /dev/null || true); report $OUT/verify/report.md"

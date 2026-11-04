@@ -1,0 +1,168 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "setup",
+    "points",
+    "profile_snippet",
+    "map_additions",
+    "risks",
+    "open_questions",
+    "notes"
+  ],
+  "properties": {
+    "setup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "file",
+        "anchor",
+        "language",
+        "snippet"
+      ],
+      "properties": {
+        "file": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "anchor": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "language": {
+          "enum": [
+            "qt",
+            "cpp",
+            "node",
+            "python",
+            "shell",
+            "other"
+          ]
+        },
+        "snippet": {
+          "type": "string",
+          "maxLength": 2000
+        }
+      }
+    },
+    "points": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "name",
+          "serves",
+          "file",
+          "anchor",
+          "language",
+          "snippet",
+          "protocol",
+          "gating"
+        ],
+        "properties": {
+          "kind": {
+            "enum": [
+              "debug",
+              "hook",
+              "puppet"
+            ]
+          },
+          "name": {
+            "type": "string",
+            "maxLength": 60
+          },
+          "serves": {
+            "type": "string",
+            "maxLength": 400
+          },
+          "file": {
+            "type": "string",
+            "maxLength": 300
+          },
+          "anchor": {
+            "type": "string",
+            "maxLength": 300
+          },
+          "language": {
+            "enum": [
+              "qt",
+              "cpp",
+              "node",
+              "python",
+              "shell",
+              "other"
+            ]
+          },
+          "snippet": {
+            "type": "string",
+            "maxLength": 4000
+          },
+          "protocol": {
+            "type": "string",
+            "maxLength": 300
+          },
+          "gating": {
+            "type": "string",
+            "maxLength": 300
+          }
+        }
+      }
+    },
+    "profile_snippet": {
+      "type": "string",
+      "maxLength": 4000
+    },
+    "map_additions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "section",
+          "fact",
+          "evidence"
+        ],
+        "properties": {
+          "section": {
+            "enum": [
+              "Safety",
+              "Screens",
+              "Flows",
+              "Fixtures and actions",
+              "Logs",
+              "Pitfalls"
+            ]
+          },
+          "fact": {
+            "type": "string",
+            "maxLength": 400
+          },
+          "evidence": {
+            "type": "string",
+            "maxLength": 300
+          }
+        }
+      }
+    },
+    "risks": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "maxLength": 400
+      }
+    },
+    "open_questions": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "maxLength": 400
+      }
+    },
+    "notes": {
+      "type": "string",
+      "maxLength": 800
+    }
+  }
+}

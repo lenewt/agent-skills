@@ -1,6 +1,6 @@
 ---
 name: blackbox-e2e
-description: Black-box end-to-end test of any GUI application (local X11 under Xvfb, or a remote X11 device over ssh), run by a separate locked-down tester (`claude -p` on Haiku, or Copilot CLI on GPT-6 Luna) that cannot read source code. Only an `e2e` command is available to it (start/stop, screenshots, taps, declared log patterns, declared SQL fixtures). Use for E2E, smoke or acceptance tests of a change, especially when the tester must not see the code. Reports PASS/FAIL per step with the total cost. A project plugs in its app with a profile (a small bash file).
+description: Black-box end-to-end test of any GUI application (local X11 under Xvfb, or a remote X11 device over ssh), run by a separate locked-down tester (`claude -p` on Haiku, or Copilot CLI on Claude Haiku 5.5) that cannot read source code. Only an `e2e` command is available to it (start/stop, screenshots, taps, declared log patterns, declared SQL fixtures). Use for E2E, smoke or acceptance tests of a change, especially when the tester must not see the code. Reports PASS/FAIL per step with the total cost. A project plugs in its app with a profile (a small bash file).
 ---
 
 # blackbox-e2e: black-box E2E through a separate, locked-down tester
@@ -23,8 +23,8 @@ its logs are, and how to apply fixtures. Requires the `uidrive` CLI of the `ui-d
 
 Profile contract: the top level holds only assignments and function definitions. It is sourced by the runner and by
 every `e2e` call. `lib/stack.sh` provides `spawn`, `kill_group`, `kill_all_groups`, `groups_status`, `group_alive`,
-`wait_for`, `xvfb_start`, `port_busy`, `rsh`, `ui_geom`, `sqlite_backup/restore/apply`, `die` (a verb fails) and
-`blocked` (setup cannot run, exit 3).
+`wait_for`, `xvfb_start`, `port_busy`, `rsh`, `ui_geom`, `sqlite_backup/restore/apply`, `puppet_send`,
+`puppet_action`, `die` (a verb fails) and `blocked` (setup cannot run, exit 3).
 
 ```bash
 PRODUCT_DESC="…"   REAL_DEVICE=0|1            # one line for the tester; 1 adds "taps have physical effects"
@@ -40,6 +40,12 @@ profile_teardown     # optional (default: profile_stop, then the DB restore when
 
 Copy `profiles/x11-command.sh` as a starting point. `--set key=value` reaches the profile as `$E2E_SET_key`, and
 `--host` as `$E2E_HOST`.
+
+Products with puppet points (a test-only Unix socket, see `../instrument-e2e/SKILL.md`) need no action code of their
+own: set `PUPPET_HOST=local|U@H` and `PUPPET_SOCK=…` and define `profile_action() { puppet_action "$@"; }`. Each line
+of an `@action` block is then one request; a reply other than `ok…` fails the action. `puppet_send HOST SOCK LINE`
+sends one line and prints the reply (client: `socat`, `nc -U` or `python3` on HOST). When a step cannot be observed
+or stimulated at all, the `instrument-e2e` skill plans the points to add.
 
 ## 2. Look first, then write the scenario (behaviour only)
 
@@ -102,7 +108,7 @@ The engine is `--engine`, else `$E2E_ENGINE`, else the calling session's tool: `
 
 | | `claude` | `copilot` |
 |---|---|---|
-| CLI and model | `claude -p --restricted`, `haiku` | Copilot CLI `copilot -p`, `gpt-6-luna` |
+| CLI and model | `claude -p --restricted`, `haiku` | Copilot CLI `copilot -p`, `claude-haiku-5.5` |
 | Billed to | the Claude Code login | Copilot AI credits (1 credit = $0.01) + 1 premium request |
 | Lockdown | only `Bash(e2e *)` + `Read(./shots/**)`; reads confined to the cwd | only `shell(e2e:*)`; `--available-tools=bash,read_bash,view`; `--disallow-temp-dir`; `env -i` |
 | Report | `--json-schema` structured output | JSON parsed from the final message |
@@ -120,7 +126,8 @@ Limits (env overrides): `E2E_BUDGET` USD 4, `E2E_MAX_CALLS` 120, `E2E_MAX_SHOTS`
 `whitebox-e2e` skill for it (`../whitebox-e2e/SKILL.md`); without `--source` nothing changes.
 
 `--scout DIR` (with `--engine copilot --source`) runs a **scout** that drafts a scenario instead of judging one. Do not
-call it directly: the `discover-e2e` skill wraps it. The scout gets three extra verbs, refused in other modes:
+call it directly: the `discover-e2e` and `instrument-e2e` skills wrap it. DIR holds `brief.md`, `draft.schema.json`
+and optionally `check.jq`, the jq filter a valid draft passes (default: a scenario draft). The scout gets three extra verbs, refused in other modes:
 `grep 'REGEX' [N]` (run logs), `sql 'ONE STATEMENT'` (SELECT/PRAGMA through `profile_query`; writes through
 `profile_fixture FILE live`, refused when the DB backup failed) and `try-action 'LINE'` (`profile_action`). Applied
 writes and actions are recorded in `priv/stimuli.log`. Optional profile hooks: `PRODUCT_MAP` (default
@@ -133,6 +140,12 @@ The runner prints `report.md`: verdict, step table, ≤ 2 screenshot paths, key 
 turns, `e2e` calls, screenshots, wall time and denied tool calls. It appends one line (with `profile`) to
 `$STATE_DIR/e2e-runs.jsonl` (default `~/.local/state/blackbox-e2e/`) and prints the cumulative cost.
 
+Every run that reached the tester or scout (any verdict) also appends one line to `$STATE_DIR/usage.jsonl`:
+`{date, skill, engine, model, cost_usd, wall_s}`. It holds nothing about the scenario (no title, profile, target,
+verdict or path). `skill` is `$E2E_SKILL` (set by the discover-e2e, whitebox-e2e and instrument-e2e wrappers), else
+`whitebox-e2e` with `--source`, else `blackbox-e2e`. `bin/e2e-usage [--since YYYY-MM-DD] [--json]` prints runs, total
+and mean cost per skill, and the grand total (`STATE_DIR=…` for a profile that sets its own).
+
 On FAIL, look at the screenshot and log lines yourself before blaming the product: a vague step or a wrong regex
 is fixed in the scenario. Denied tool calls mean the tester tried to leave its box; mention them.
 
@@ -141,7 +154,7 @@ PASS. Report each deviation to the user next to the verdict: it is either a scen
 
 ## Files
 
-`bin/e2e-run.sh` runner · `bin/e2e` tester verbs · `bin/e2e-lint.sh` · `lib/stack.sh` profile helpers ·
-`profiles/` built-in profiles · `templates/brief.md` (tester brief) · `templates/report.schema.json` ·
-`templates/scenario.example.md`. A run dir holds `sandbox/` (the tester's cwd: `shots/` only) and `priv/` (shim,
+`bin/e2e-run.sh` runner · `bin/e2e` tester verbs · `bin/e2e-lint.sh` · `bin/e2e-usage` cost per skill ·
+`lib/stack.sh` profile helpers · `profiles/` built-in profiles · `templates/brief.md` (tester brief) ·
+`templates/report.schema.json` · `templates/scenario.example.md`. A run dir holds `sandbox/` (the tester's cwd: `shots/` only) and `priv/` (shim,
 `e2e.env`, prompt, process output, `calls.log`); `result.json(l)` is the raw tester output, `tester.json` normalised.

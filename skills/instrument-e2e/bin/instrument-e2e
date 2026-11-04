@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+# instrument-e2e: plan the debug, hook and puppet points that make a product testable where a
+# black-box tester cannot observe or stimulate it, with a cheap, separate scout (Copilot CLI,
+# read-only source, `e2e` verbs only). The scout writes a plan; it changes nothing. See ../SKILL.md.
+#
+#   instrument-e2e --profile NAME|FILE [--from DISCOVER_DRAFT_DIR] [--goal TEXT] [--change RANGE]
+#                  [--ticket FILE] [--source DIR] [--host USER@HOST] [--set KEY=VALUE]...
+#                  [--model M] [--budget USD] [--out DIR]
+#   instrument-e2e --accept-map PLAN_DIR [--only N[,N...]]
+#
+# --from     a discover-e2e draft dir: its steps, open questions and missing stimuli become the
+#            items to make testable (--profile, --change and --goal default to the draft's)
+# --goal     one line: what must become testable (default: the draft's goal, else the first
+#            commit subject of --change)
+# --change   commits under test (default: @{upstream}..HEAD, else HEAD~1..HEAD)
+# --ticket   a text file with the ticket, first 6000 bytes
+# --accept-map  append the plan's verified map additions (all, or the numbered ones) to the
+#            profile's product map (PRODUCT_MAP, default <state>/maps/<profile>.md)
+# Prints a short summary; the plan dir holds plan.md, points.json, profile-snippet.sh,
+# map-additions.md, open-questions.md, draft.json and the scout's run (scout/).
+set -euo pipefail
+
+SKILL="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+BB=${BLACKBOX_E2E:-$SKILL/../blackbox-e2e}
+[ -x "$BB/bin/e2e-run.sh" ] || { echo "blackbox-e2e not found (set BLACKBOX_E2E)" >&2; exit 2; }
+BB=$(cd "$BB" && pwd)
+MAP_TEMPLATE=${DISCOVER_E2E:-$SKILL/../discover-e2e}/templates/map.example.md
+export E2E_SKILL=instrument-e2e   # usage.jsonl
+
+usage() { awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; exit 2; }
+PROFILE="" FROM="" CHANGE="" GOAL="" TICKET="" SOURCE="" OUT="" ACCEPT="" ONLY=""
+RUN_OPTS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --profile)    PROFILE=$2; shift 2 ;;
+        --from)       FROM=$(cd "$2" && pwd) || exit 2; shift 2 ;;
+        --change)     CHANGE=$2; shift 2 ;;
+        --goal)       GOAL=$2; shift 2 ;;
+        --ticket)     TICKET=$2; shift 2 ;;
+        --source)     SOURCE=$(cd "$2" && pwd) || exit 2; shift 2 ;;
+        --host|--set|--model|--budget) RUN_OPTS+=("$1" "$2"); shift 2 ;;
+        --out)        OUT=$2; shift 2 ;;
+        --accept-map) ACCEPT=$(cd "$2" && pwd) || exit 2; shift 2 ;;
+        --only)       ONLY=$2; shift 2 ;;
+        *) usage ;;
+    esac
+done
+
+# --- profile lookup (same rules as e2e-run.sh) ------------------------------------------
+find_profile() {
+    local d
+    if [ -f "$1" ]; then (cd "$(dirname "$1")" && echo "$PWD/$(basename "$1")"); return; fi
+    IFS=: read -r -a dirs <<< "${E2E_PROFILE_PATH:-}"
+    for d in "${dirs[@]}" "$BB/profiles"; do
+        [ -n "$d" ] && [ -f "$d/$1.sh" ] && { (cd "$d" && echo "$PWD/$1.sh"); return; }
+    done
+    return 1
+}
+# profile_info FILE: prints the map path.
+profile_info() {
+    (
+        name=$(basename "$1" .sh) STATE_DIR="" PRODUCT_MAP=""
+        # shellcheck source=/dev/null
+        . "$BB/lib/stack.sh"
+        # shellcheck source=/dev/null
+        . "$1" > /dev/null 2>&1
+        state=${STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/blackbox-e2e}
+        echo "${PRODUCT_MAP:-$state/maps/$name.md}"
+    )
+}
+# profile_wiring FILE: what profile_snippet must extend (LOG_FILES, profile_start/_action as defined).
+profile_wiring() {
+    (
+        LOG_FILES=()
+        # shellcheck source=/dev/null
+        . "$BB/lib/stack.sh"
+        # shellcheck source=/dev/null
+        . "$1" > /dev/null 2>&1
+        set +e
+        declare -p LOG_FILES 2> /dev/null | sed 's/^declare -a //'
+        declare -p PUPPET_HOST PUPPET_SOCK 2> /dev/null | sed 's/^declare -- //'
+        declare -f profile_start profile_action 2> /dev/null
+        true
+    )
+}
+
+# --- accept map additions -----------------------------------------------------------------
+if [ -n "$ACCEPT" ]; then
+    if [ ! -f "$ACCEPT/draft.json" ] || [ ! -f "$ACCEPT/meta" ]; then echo "$ACCEPT is not an instrument-e2e plan" >&2; exit 2; fi
+    MAP=$(sed -n 's/^map=//p' "$ACCEPT/meta")
+    PNAME=$(sed -n 's/^profile=//p' "$ACCEPT/meta")
+    mkdir -p "$(dirname "$MAP")"
+    if [ ! -f "$MAP" ]; then
+        if [ -f "$MAP_TEMPLATE" ]; then sed "s/<profile name>/$PNAME/" "$MAP_TEMPLATE" > "$MAP"
+        else printf '# Product map: %s\n' "$PNAME" > "$MAP"; fi
+    fi
+    python3 - "$MAP" "$ACCEPT/draft.json" "$ONLY" "$(sed -n 's/^title=//p' "$ACCEPT/meta")" <<'EOF'
+import json, re, sys
+path, draft, only, title = sys.argv[1:5]
+adds = json.load(open(draft)).get("map_additions", [])
+keep = {int(n) for n in only.split(",") if n.strip()} if only else set(range(1, len(adds) + 1))
+lines = open(path).read().rstrip("\n").split("\n")
+added = 0
+for n, a in enumerate(adds, 1):
+    if n not in keep:
+        continue
+    head = "## " + a["section"]
+    entry = "- %s (verified: %s; %s)" % (a["fact"].strip(), a["evidence"].strip(), title)
+    if head not in lines:
+        lines += ["", head]
+    i = lines.index(head) + 1
+    while i < len(lines) and not lines[i].startswith("## "):
+        i += 1
+    while i > 0 and lines[i - 1] == "":
+        i -= 1
+    lines.insert(i, entry)
+    added += 1
+open(path, "w").write("\n".join(lines) + "\n")
+print("map: %d addition(s) appended to %s" % (added, path))
+EOF
+    exit 0
+fi
+
+# --- inputs --------------------------------------------------------------------------------
+if [ -n "$FROM" ]; then
+    [ -f "$FROM/scenario.md" ] || [ -f "$FROM/open-questions.md" ] || { echo "--from: $FROM is not a discover-e2e draft" >&2; exit 2; }
+    if [ -f "$FROM/meta" ]; then  # pfile: the profile path (a file profile has no lookup name)
+        PROFILE=${PROFILE:-$(sed -n 's/^pfile=//p' "$FROM/meta")}
+        PROFILE=${PROFILE:-$(sed -n 's/^profile=//p' "$FROM/meta")}
+        CHANGE=${CHANGE:-$(sed -n 's/^change=//p' "$FROM/meta")}
+        GOAL=${GOAL:-$(sed -n 's/^title=//p' "$FROM/meta")}
+    fi
+fi
+[ -n "$PROFILE" ] || usage
+PFILE=$(find_profile "$PROFILE") || { echo "profile '$PROFILE' not found (E2E_PROFILE_PATH, $BB/profiles)" >&2; exit 2; }
+PNAME=$(basename "$PFILE" .sh)
+MAP=$(profile_info "$PFILE")
+SOURCE=${SOURCE:-$(git rev-parse --show-toplevel 2> /dev/null)} || true
+[ -n "$SOURCE" ] || { echo "--source: not in a git checkout" >&2; exit 2; }
+if [ -z "$CHANGE" ]; then
+    if git -C "$SOURCE" rev-parse -q --verify '@{upstream}' > /dev/null 2>&1; then CHANGE='@{upstream}..HEAD'; else CHANGE='HEAD~1..HEAD'; fi
+fi
+git -C "$SOURCE" rev-list -n 1 "${CHANGE##*..}" > /dev/null 2>&1 || { echo "--change: bad range $CHANGE" >&2; exit 2; }
+[ -z "$TICKET" ] || [ -f "$TICKET" ] || { echo "--ticket: no such file" >&2; exit 2; }
+GOAL=${GOAL:-$(git -C "$SOURCE" log --format=%s -n 1 "${CHANGE##*..}")}
+if [ -n "$OUT" ]; then mkdir -p "$OUT"; OUT=$(cd "$OUT" && pwd)
+else OUT=$(mktemp -d "${CLAUDE_SCRATCHPAD:-${TMPDIR:-/tmp}}/instrument-$(date +%Y%m%d-%H%M%S)-XXXX"); fi
+
+safety() {  # the map's Safety section, without the template's placeholder line
+    [ -f "$MAP" ] && awk '/^## /{ on = ($0 == "## Safety"); next } on' "$MAP" | grep -v '^Free text copied' | sed '/./,$!d'
+}
+# draft_part FILE HEADING: the lines of one "## HEADING" section, without blank lines.
+draft_part() { [ -f "$1" ] && awk -v h="$2" '/^## /{ on = (substr($0, 4) == h); next } on && NF' "$1"; }
+{
+    echo "# Scenario: instrument: $GOAL"
+    echo "Target: $PNAME"
+    echo
+    echo "## Task"
+    echo "Goal: $GOAL"
+    echo "Make testable what the black-box tester cannot observe or stimulate for this goal: for each item, an"
+    echo "existing means (log line, config row, action), else the smallest debug, hook or puppet point."
+    echo "Change under test: \`$CHANGE\` in the source tree $SOURCE (read it with \`e2e git show\` / \`e2e git diff\`)."
+    echo
+    git -C "$SOURCE" log --oneline -n 20 "$CHANGE" | sed 's/^/    /'
+    echo
+    git -C "$SOURCE" diff --stat=120 "$CHANGE" | tail -n 60 | sed 's/^/    /'
+    st=$(git -C "$SOURCE" status --short --untracked-files=no | head -n 30)
+    [ -z "$st" ] || { echo; echo "Uncommitted changes (also under test):"; printf '%s\n' "$st" | sed 's/^/    /'; }
+    [ -z "$TICKET" ] || { echo; echo "Ticket:"; head -c 6000 "$TICKET" | sed 's/^/    /'; echo; }
+    if [ -n "$FROM" ]; then
+        echo
+        echo "## Items to make testable (from a discover-e2e draft)"
+        s=$(draft_part "$FROM/scenario.md" Steps || true)
+        [ -z "$s" ] || { echo "Draft steps:"; printf '%s\n' "$s" | sed 's/^/    /'; }
+        s=$(grep -E '^- ' "$FROM/open-questions.md" 2> /dev/null || true)
+        [ -z "$s" ] || { echo "Open questions of the draft scout:"; printf '%s\n' "$s" | sed 's/^/    /'; }
+        s=$(draft_part "$FROM/discovery.md" "Not in the draft fixtures" || true)
+        [ -z "$s" ] || { echo "Stimuli the draft scout applied that the draft fixtures lack:"; printf '%s\n' "$s" | sed 's/^/    /'; }
+    fi
+    echo
+    echo "## Current profile (extend it in profile_snippet; keep its start command)"
+    profile_wiring "$PFILE" | sed 's/^/    /'
+    # The scout reads only --source: the contract comes inline (headings one level down).
+    echo
+    echo "## Contract (instrument-e2e protocol)"
+    sed -e '1{/^# /d}' -e 's/^## /### /' "$SKILL/references/protocol.md"
+    echo
+    echo "## Safety"
+    s=$(safety || true)
+    if [ -n "$s" ]; then echo "$s"; else echo "No restriction declared."; fi
+} > "$OUT/task.md"
+printf 'profile=%s\npfile=%s\nchange=%s\nmap=%s\ntitle=%s\n' "$PNAME" "$PFILE" "$CHANGE" "$MAP" "$GOAL" > "$OUT/meta"
+
+# --- scout -----------------------------------------------------------------------------------
+set +e
+"$BB/bin/e2e-run.sh" "$OUT/task.md" --profile "$PFILE" --scout "$SKILL/templates" --source "$SOURCE" \
+    --out "$OUT/scout" "${RUN_OPTS[@]}" > "$OUT/scout.log" 2>&1
+RC=$?
+set -e
+SCOUT_LINE=$(grep -m1 -E '^Profile .* scout ' "$OUT/scout.log" || true)
+if [ "$RC" != 0 ] || [ ! -f "$OUT/scout/draft.json" ]; then
+    tail -n 20 "$OUT/scout.log"
+    echo "instrument-e2e: no plan (rc $RC); log $OUT/scout.log"
+    exit 1
+fi
+
+# --- plan files ----------------------------------------------------------------------------------
+D=$OUT/scout/draft.json
+cp "$D" "$OUT/draft.json"
+jq '{setup, points}' "$D" > "$OUT/points.json"
+jq -r --arg goal "$GOAL" --arg profile "$PNAME" --arg proto "$SKILL/references/protocol.md" '
+    def cell: tostring | gsub("\n"; " ") | gsub("\\|"; "\\|");
+    def fence: {qt: "cpp", cpp: "cpp", node: "js", python: "python", shell: "sh"}[.language] // "";
+    "# Instrumentation plan: \($goal)\n",
+    "Profile \($profile) · \(.points | length) point(s). Contract: \($proto). Wiring: profile-snippet.sh.\n",
+    (if .setup then "## Setup (once, before the points)\n",
+        "- File: `\(.setup.file)`, insert before: `\(.setup.anchor)`", "",
+        "```\(.setup | fence)", (.setup.snippet // "" | sub("\n+$"; "")), "```\n"
+     else "## Setup\n\n(none proposed: load the library before the points yourself)\n" end),
+    "| # | Kind | Name | Serves | File:anchor | Protocol |", "|---|---|---|---|---|---|",
+    (.points | to_entries[] | .value as $p
+     | "| \(.key + 1) | \($p.kind) | \($p.name | cell) | \($p.serves | cell) | `\($p.file | cell)`:`\($p.anchor | cell)` | \($p.protocol | cell) |"),
+    (.points | to_entries[] | .value as $p
+     | "\n## \(.key + 1). \($p.kind) `\($p.name)`\n",
+       "- Serves: \($p.serves)", "- File: `\($p.file)`, insert before: `\($p.anchor)`", "- Language: \($p.language)",
+       "- Gating: \($p.gating)", "- Protocol: \($p.protocol)", "",
+       "```\($p | fence)", ($p.snippet // "" | sub("\n+$"; "")), "```"),
+    "\n## Risks\n", (if (.risks | length) > 0 then .risks[] | "- \(.)" else "(none)" end),
+    "\nNotes: \(.notes)"' "$D" > "$OUT/plan.md"
+{
+    echo "# instrument-e2e: proposed wiring for profile $PNAME (review it; see $SKILL/references/protocol.md)"
+    jq -r '.profile_snippet' "$D"
+} > "$OUT/profile-snippet.sh"
+jq -r '"# Proposed map additions (accept: instrument-e2e --accept-map DIR [--only N,...])\n",
+    (.map_additions // [] | to_entries[] | "\(.key + 1). [\(.value.section)] \(.value.fact) (evidence: \(.value.evidence))")' \
+    "$D" > "$OUT/map-additions.md"
+jq -r '"# Open questions\n", ((.open_questions // [])[] | "- \(.)")' "$D" > "$OUT/open-questions.md"
+
+echo "instrument-e2e: plan in $OUT"
+echo "  scout: ${SCOUT_LINE:-?}"
+echo "  setup: $(jq -r 'if .setup then "\(.setup.file): \(.setup.anchor)" else "none" end' "$D")"
+echo "  points: $(jq -r '.points | length as $n | "\($n)" + (if $n > 0 then " (" + (group_by(.kind) | map("\(.[0].kind) \(length)") | join(", ")) + ")" else "" end)' "$D")"
+echo "  risks: $(jq '.risks | length' "$D")"
+echo "  map additions: $(jq '.map_additions | length' "$D") (map: $MAP)"
+echo "  open questions: $(jq '.open_questions | length' "$D")"
+echo "  files: $OUT/plan.md, $OUT/profile-snippet.sh, $OUT/open-questions.md, $OUT/map-additions.md, $OUT/points.json"
